@@ -1,7 +1,7 @@
 """wolfpack-sync.py: the kids' Spotify playlists, followed all the way to their Cardputers.
 
 Run on paqman (it holds the data, the keyring and the rip tools): python3 -I wolfpack-sync.py
-A systemd user timer runs it every 6 hours (wolfpack-sync.timer, next to this file).
+A systemd user timer runs it every hour (wolfpack-sync.timer, next to this file).
 
 1. Each playlist's Spotify embed page again (DATA/spotify/<id>.html; a failed fetch keeps the old page).
 2. resolve.py: playlists.json in Spotify's order, hand-added songs kept at the end; a YouTube Music

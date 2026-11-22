@@ -26,6 +26,14 @@ static void testOutbox() {
   Entry e; e.clientId = "naomie-1-1"; e.roomId = "wolfpack"; e.body = "salut";
   recordAttempt(e, -5, 1000); assert(e.state == State::Sending && e.nextAttemptAt == 6000 && !due(5999, e.nextAttemptAt) && due(6000, e.nextAttemptAt));
   recordAttempt(e, 403, 7000); assert(e.state == State::Failed && e.lastStatus == 403);
+  // The connection taken (a card sync pass) is no attempt: no count, no doubling, tried again 2 s later.
+  { Entry b; recordAttempt(b, kStatusConnectionBusy, 100); assert(b.attempts == 0 && b.state == State::Sending && b.nextAttemptAt == 2100);
+    recordAttempt(b, kStatusConnectionBusy, 200); assert(b.attempts == 0 && b.nextAttemptAt == 2200); }
+  // A server error on the same message, kMaxServerErrors times: FAILED, so it stops holding the others back.
+  { Entry s5; for (int i = 0; i < kMaxServerErrors - 1; i++) recordAttempt(s5, 500, 0); assert(s5.state == State::Sending);
+    recordAttempt(s5, 500, 0); assert(s5.state == State::Failed && s5.lastStatus == 500); }
+  // No answer at all (no Wi-Fi, no server) keeps retrying, however long.
+  { Entry t; for (int i = 0; i < 20; i++) recordAttempt(t, -1, 0); assert(t.state == State::Sending); }
   retry(e, 9000); assert(e.state == State::Sending && e.attempts == 0 && due(9000, e.nextAttemptAt));
   // due() across the millis() wrap.
   assert(due(5, 0xFFFFFFF0u) && !due(0xFFFFFFF0u, 5));

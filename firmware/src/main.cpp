@@ -74,7 +74,7 @@ const char *failureText(const char *english) {
   if (frenchUi) for (const auto &pair : kFrench) if (!strcmp(english, pair[0])) return pair[1];
   return english;
 }
-constexpr char kFirmwareVersion[] = "v0.62";
+constexpr char kFirmwareVersion[] = "v0.63";
 // The author of the device's own notes to its owner: no account has this id.
 constexpr char kNoticeAuthor[] = "kidputer";
 // Lyrics show only when asked for: L (lyrics) in English, P (paroles) in French, turns them on and off; remembered.
@@ -1884,7 +1884,7 @@ bool openServer(WiFiClientSecure &client, uint32_t timeoutMs) {
 bool requestJson(const String &path, const char *method, const String &requestBody, String &responseBody, int &status) {
   if (chargingModeActive) { status = HTTPC_ERROR_CONNECTION_REFUSED; return false; }
   const os::SecureLease lease(os::Priority::Background);
-  if (!lease.held) { status = HTTPC_ERROR_CONNECTION_REFUSED; return false; }
+  if (!lease.held) { status = outbox::kStatusConnectionBusy; return false; }  // taken (card sync): not the server's answer
   WiFiClientSecure client;
   if (!openServer(client, kSecureConnectTimeoutMs)) { status = HTTPC_ERROR_CONNECTION_REFUSED; lastHttpStatus = status; return false; }
   const String viaPin = tlsChainWorks ? String() : serverStageDetail.get();
@@ -2041,7 +2041,9 @@ void sendQueuedMessages() {
       saveOutboxLocked();
     }
     xSemaphoreGive(stateMutex);
-    if (!parsed && outbox::classify(status) == outbox::Outcome::Retry) break;  // The server is out of reach: the rest wait too.
+    // No connection at all (taken, no Wi-Fi, no server): the rest wait too. An error answer about this message
+    // doesn't hold the others back.
+    if (!parsed && (status <= 0 || status == outbox::kStatusConnectionBusy)) break;
   }
 }
 
@@ -4001,18 +4003,73 @@ void drawEmoji(int kind, int x, int y, uint32_t background) {
   }
 }
 
-// A chat line: text through Font0, recipes as pictures in their two letters' space.
-void printChatText(const String &text) {
+// Emoji sent from phones (the app, the web): their code points drawn as our pictures, so a heart a phone
+// substituted for "<3" still shows as one. Variation selectors (U+FE0F) and joiners after them are dropped.
+// Index into kEmojiCodes, or -1.
+int phoneEmoji(uint32_t code) {
+  switch (code) {
+    case 0x2764: case 0x2665: case 0x2661: case 0x1F496: case 0x1F497: case 0x1F498: case 0x1F499: case 0x1F49A:
+    case 0x1F49B: case 0x1F49C: case 0x1F49D: case 0x1F495: case 0x1F493: case 0x1F49E: case 0x1F90D: case 0x1F5A4:
+    case 0x1F9E1: case 0x1F970: case 0x1F60D: return 4;                                  // hearts, heart eyes: <3
+    case 0x1F642: case 0x263A: case 0x1F60A: case 0x1F600: return 0;                   // :)
+    case 0x1F641: case 0x2639: case 0x1F61E: case 0x1F622: case 0x1F62D: return 1;     // :(
+    case 0x1F609: return 2;                                                            // ;)
+    case 0x1F603: case 0x1F604: case 0x1F601: case 0x1F606: case 0x1F602: case 0x1F923: return 3;  // :D
+    case 0x1F61B: case 0x1F61C: case 0x1F61D: return 5;                                // :P
+    case 0x1F62E: case 0x1F62F: case 0x1F632: case 0x1F631: return 6;                  // :O
+    case 0x1F615: case 0x1F914: return 7;                                              // :/
+  }
+  return -1;
+}
+
+// Lookalikes of a recipe's characters as phones and other keyboards send them: the "<" and "3" of a heart.
+// ‹ U+2039, ＜ U+FF1C, 〈 U+3008 count as <; ３ U+FF13 as 3. (Jay, 2026-11-22: a heart on Naomie's device
+// stopped drawing; anything but the plain keys was left as text.)
+String chatRecipeText(const String &text) {
+  String out; out.reserve(text.length());
+  for (size_t index = 0; index < text.length();) {
+    const uint8_t first = static_cast<uint8_t>(text[index]);
+    const int length = first >= 0xF0 ? 4 : first >= 0xE0 ? 3 : first >= 0xC0 ? 2 : 1;
+    if (length == 3 && index + 2 < text.length()) {
+      const uint32_t code = ((first & 0x0F) << 12) | ((static_cast<uint8_t>(text[index + 1]) & 0x3F) << 6) | (static_cast<uint8_t>(text[index + 2]) & 0x3F);
+      if (code == 0x2039 || code == 0xFF1C || code == 0x3008) { out += '<'; index += 3; continue; }
+      if (code == 0xFF13) { out += '3'; index += 3; continue; }
+    }
+    out += text.substring(index, index + length);
+    index += length;
+  }
+  return out;
+}
+
+// A chat line: text through Font0, recipes and phone emoji as pictures in a two-letter space.
+void printChatText(const String &raw) {
+  const String text = chatRecipeText(raw);
   int start = 0;
-  for (int at = 0; at < static_cast<int>(text.length()); at++) {
-    const int kind = emojiAt(text, at);
-    if (kind < 0) continue;
-    if (at > start) printFont0Text(text.substring(start, at));
+  auto picture = [&](int kind) {
     const int x = uiCanvas.getCursorX(), y = uiCanvas.getCursorY();
     const int advance = uiCanvas.textWidth("  ");
     drawEmoji(kind, x + (advance - 17) / 2, y, uiCanvas.getTextStyle().back_rgb888);
     uiCanvas.setCursor(x + advance, y);
-    start = at + 2; at++;
+  };
+  for (int at = 0; at < static_cast<int>(text.length());) {
+    const uint8_t first = static_cast<uint8_t>(text[at]);
+    if (first >= 0xE0 && at + 2 < static_cast<int>(text.length())) {
+      const int length = first >= 0xF0 ? 4 : 3;
+      uint32_t code = length == 4 ? first & 0x07 : first & 0x0F;
+      for (int extra = 1; extra < length && at + extra < static_cast<int>(text.length()); extra++) code = (code << 6) | (static_cast<uint8_t>(text[at + extra]) & 0x3F);
+      const int kind = phoneEmoji(code);
+      if (kind >= 0 || code == 0xFE0F || code == 0x200D) {
+        if (at > start) printFont0Text(text.substring(start, at));
+        if (kind >= 0) picture(kind);
+        at += length; start = at;
+        continue;
+      }
+    }
+    const int kind = emojiAt(text, at);
+    if (kind < 0) { at++; continue; }
+    if (at > start) printFont0Text(text.substring(start, at));
+    picture(kind);
+    at += 2; start = at;
   }
   if (start < static_cast<int>(text.length())) printFont0Text(text.substring(start));
 }
@@ -4096,15 +4153,15 @@ void sendDraft() {
   outbox::Entry entry; entry.clientId = message.clientId.c_str(); entry.roomId = message.roomId.c_str(); entry.body = message.body.c_str();
   entry.replyToId = message.replyToId; entry.createdAt = message.createdAt; entry.nextAttemptAt = millis();
   xSemaphoreTake(stateMutex, portMAX_DELAY);
-  // A full outbox refuses the message and says so; the text stays in the composer.
+  // A full outbox still sends the message to nearby Cardputers (no Wi-Fi needed) and keeps it on the card as
+  // unsent: it joins the outbox for the server once there's room (reconcileOutboxLocked). It used to refuse
+  // the message outright, nearby included (Jay, 2026-11-22: "BOITE PLEINE", the kids couldn't send at all).
   const bool full = outboxEntries.size() >= outbox::kMaxEntries;
-  if (!full) {
-    outboxEntries.push_back(entry); saveOutboxLocked();
-    messages.push_back(message); trimHistory(); saveHistoryLocked();
-    nearbySends.push_back({message.clientId, millis(), millis(), 0, 0});
-  }
+  if (!full) { outboxEntries.push_back(entry); saveOutboxLocked(); }
+  messages.push_back(message); trimHistory(); saveHistoryLocked();
+  nearbySends.push_back({message.clientId, millis(), millis(), 0, 0});
   xSemaphoreGive(stateMutex);
-  if (full) { showChatNotice("OUTBOX FULL: 16 NOT SENT YET", "BOITE PLEINE: 16 EN ATTENTE"); playDeniedTone(); return; }
+  if (full) showChatNotice("OUTBOX FULL: SENT NEARBY ONLY", "BOITE PLEINE: ENVOYE AUX PROCHES");
   serviceNearbySends();
   syncOverride = true;
   draft = ""; historyOffset = 0; replyToMessageId = 0; replyToAuthor = ""; replyToBody = ""; renderDirty = true;
@@ -4600,9 +4657,9 @@ os::Owner frontApp() {
 }
 
 // Card sync: the owner's playlist onto the card, whenever it sits on Wi-Fi with no media app open and
-// nothing playing. A pass a minute after boot, then every 30 minutes (10 after one that failed).
+// nothing playing. A pass a minute after boot, then every 5 minutes (10 after one that failed).
 constexpr uint32_t kCardSyncFirstMs = 60000;
-constexpr uint32_t kCardSyncEveryMs = 30 * 60000;
+constexpr uint32_t kCardSyncEveryMs = 5 * 60000;  // one small request when nothing changed (the playlist's changed time)
 constexpr uint32_t kCardSyncRetryMs = 10 * 60000;
 constexpr uint32_t kCardSyncMoreMs = 2 * 60000;  // More songs to get, or the connection was busy.
 uint32_t nextCardSyncAt = kCardSyncFirstMs;
@@ -4626,6 +4683,14 @@ void serviceCardSync() {
     homeNoticeAt = millis(); homeNoticeGood = true; renderDirty = true; cardSyncNews = 0;
   }
   cardSyncWasRunning = running;
+  // Messages waiting to send come first: a pass ends early and the next waits until they're gone.
+  bool messagesWaiting = false;
+  if (stateMutex && xSemaphoreTake(stateMutex, 0) == pdTRUE) {
+    for (const auto &entry : outboxEntries) messagesWaiting |= entry.state == outbox::State::Sending;
+    xSemaphoreGive(stateMutex);
+  }
+  if (running && messagesWaiting) { library::stopCardSync(0); return; }
+  if (messagesWaiting) return;
   const bool mediaBusy = frontApp() == os::mediaOwner() || media::active() || mediaStarting || mediaTasksWanted;
   if (running && (mediaBusy || chargingModeActive)) { library::stopCardSync(0); return; }
   if (running || mediaBusy || chargingModeActive || !sdReady || WiFi.status() != WL_CONNECTED || !library::configured()) return;

@@ -49,9 +49,18 @@ inline uint32_t backoffMs(uint16_t attempts) {
 // Rounds of modular time: true when `at` has come, across the 49-day millis() wrap.
 inline bool due(uint32_t now, uint32_t at) { return static_cast<int32_t>(now - at) >= 0; }
 
+// The device's one network connection was taken (a card sync pass): not an attempt, no answer from anyone. It
+// used to count as one and double the wait each time, so a device busy syncing let messages wait minutes
+// apart, and the first one held all the others back (Emma's outbox full, 2026-11-22).
+constexpr int kStatusConnectionBusy = -1000;
+// A server error on the same message this many times is not a passing hiccup: FAILED, so Enter can resend it
+// and it stops holding the others back.
+constexpr uint16_t kMaxServerErrors = 6;
+
 inline void recordAttempt(Entry &entry, int status, uint32_t now) {
+  if (status == kStatusConnectionBusy) { entry.nextAttemptAt = now + 2000; return; }
   entry.attempts++; entry.lastStatus = status;
-  if (classify(status) == Outcome::Failed) entry.state = State::Failed;
+  if (classify(status) == Outcome::Failed || (status >= 500 && entry.attempts >= kMaxServerErrors)) entry.state = State::Failed;
   else entry.nextAttemptAt = now + backoffMs(entry.attempts);
 }
 

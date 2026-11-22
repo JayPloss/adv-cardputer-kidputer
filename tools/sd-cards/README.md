@@ -4,7 +4,7 @@
 each playlist's Spotify page again, matches and rips only the new songs (a weak match waits in
 `<data>/needs-a-look.txt` for a `FIX` entry in `rip.py`), copies them to ori-san, rescans Navidrome and makes
 each kid's playlist again in Spotify's order; the Cardputers then fetch what they lack on home Wi-Fi.
-A systemd user timer runs it every 6 hours: `wolfpack-sync.service` and `.timer` here, linked into
+A systemd user timer runs it every hour: `wolfpack-sync.service` and `.timer` here, linked into
 `~/.config/systemd/user`. `journalctl --user -u wolfpack-sync` shows each run. Songs removed on Spotify leave
 the Navidrome playlist, and from the next firmware after v0.61 the card moves them to `/music/.removed/<Kid>`
 (hidden from the player, never deleted; v0.61 itself leaves them in place).
@@ -26,7 +26,7 @@ Run on paqman. Data (Spotify pages, matches, file map) lives in `~/.local/share/
    Rerunning copies only what's missing.
    Since v0.61 the Cardputer does this itself over Wi-Fi: it mirrors its owner's playlist (the Navidrome
    playlist named after the login) into `/music/<Playlist>` with the same names, fetching only what's
-   missing, at most 4 songs a pass (passes 2 minutes apart, then every 30 minutes), renaming a renumbered
+   missing, at most 4 songs a pass (passes 2 minutes apart, then every 5 minutes (one small request when the playlist is unchanged)), renaming a renumbered
    song, deleting nothing (after v0.61: songs off the list move to `/music/.removed/<Kid>`). Files keep Navidrome's ID3 tag: the v0.59 player reads past it. STATUS shows
    the state on its MUSIC line. So after step 4, a new song reaches the cards on home Wi-Fi with no card in the reader.
 7. Lyrics: `uv run --with mutagen python -I lyrics.py` puts each song's lyrics in `<data>/lyrics/<file stem>.lrc`

@@ -3,6 +3,7 @@ export const homeApps = ['SUPACHAT','MUSIC','BOOKS','R/C','TIMER','ALARM','SCREE
 const clockScreens = ['timer','alarm','screen-time','stopwatch'];
 const settingsScreens = ['networks','password','volume','status','language','charging-confirm','changelog'];
 export const changelog = [
+  {version:'v0.63',lines:['Messages send while syncing','Full outbox: sent nearby','Phone hearts and faces','Lyrics within minutes','New songs checked often']},
   {version:'v0.62',lines:['Lyrics: L (P in French)','Shuffle M, repeat R, delete D','New songs told in chat','Ringtones for alarms','Songs off the list leave','No impossible alarm times','Sleeps after 10 idle min','Fast Wi-Fi: no restart']},
   {version:'v0.61',lines:['Emoji show as pictures','New songs come over Wi-Fi','STATUS: music sync line','Battery % keeps up charging']},
   {version:'v0.60',lines:['Big clock after 2 min idle','Sleep timer: T in players','Books at bedtime: 30 min','Alarm can play a song','School nights: book off 21:30']},
