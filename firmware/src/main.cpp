@@ -29,7 +29,7 @@
 #endif
 #include "apps/system/keypress_song.h"
 #include "apps/media/media_player.h"
-#include "music_library.h"
+#include "apps/media/music_library.h"
 #include "os.h"
 #include "shared_text.h"
 #include <new>
