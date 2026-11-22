@@ -348,6 +348,11 @@ uint32_t positionSeconds() {
   return startPosition + (rate ? static_cast<uint32_t>(samplesPlayed / rate) : 0);
 }
 
+uint32_t positionMs() {
+  const uint32_t rate = sampleRate;
+  return startPosition * 1000 + (rate ? static_cast<uint32_t>(samplesPlayed * 1000 / rate) : 0);
+}
+
 uint32_t durationSeconds() { return totalSeconds; }
 const char *failure() { return failureText; }
 uint32_t lowestHeap() { return lowestFreeHeap; }

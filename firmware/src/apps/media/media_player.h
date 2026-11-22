@@ -23,6 +23,7 @@ void stop();
 State state();
 bool active();  // Connecting, Playing or Paused.
 uint32_t positionSeconds();
+uint32_t positionMs();  // For lyrics: the line on screen follows the song to the tenth of a second.
 uint32_t durationSeconds();  // 0 when unknown (streams).
 const char *failure();
 uint32_t lowestHeap();

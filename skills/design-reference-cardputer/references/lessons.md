@@ -58,3 +58,8 @@ Each item says where it came from. Add to this list; don't delete from it unless
 - **A footer that names a mode collides with the mode's own label in text checks.** The players' footer says T SLEEP, so a scenario checking that the timer is gone must look for "SLEEP" with a time, not the word (runtime emulator `book-sleep`, 2026-11-13).
 - **The big clock swallows the first key.** Anything that takes over the screen after idle gives the key that ends it to nobody, as the boot and charging quarantines do: a 1 pressed to wake must not open chat.
 - **The alarm row holds four columns at most.** Time (x2, 104 px), MON-FRI, SAT-SUN and SOUND as 16 px cells centred at 126, 174 and 218, their x1 labels 6 px or more apart. A fifth needs a second line or a page, not narrower cells.
+
+## Lyrics (v0.62)
+
+- **The line being sung is read at a glance, so it is Font0 x2, never x1.** Two lines of 19 characters, broken at a space; the next line is x1 grey under it, the title x1 grey above with a 6 px bar, and the clock times give way. A line too long for two lines is cut with `~`, never shrunk (fonts.md: pick the size first). Shown only for songs on the card with a timed `.lrc`; without one the player is unchanged (runtime emulator `card-sync`, `lyrics.png`, 2026-11-21).
+- **A letter key is the first letter of the word its hint shows, in the device's language.** L LYRICS / P PAROLES, F FAVOURITE / A AIME. Getting there took four tries on 2026-11-21: P on both languages, L for AIME, then F beside the word LIKE, then P beside SANS PAROLES (Jay). Check the letter against the word printed next to it on the screen, in both languages, not against a word in your head.

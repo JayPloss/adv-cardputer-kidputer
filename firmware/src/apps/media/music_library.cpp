@@ -516,6 +516,8 @@ constexpr int kSyncSongsPerPass = 4;
 TaskHandle_t syncHandle = nullptr;
 volatile bool syncStop = false;
 volatile int syncAdded = 0;
+String syncAddedNames;  // Written by the sync task, read once it has ended.
+int syncNamesListed = 0;
 volatile int syncTotal = -1, syncDone = 0, syncMissing = 0;
 const char *volatile syncState = "NOT RUN YET";
 
@@ -542,7 +544,12 @@ bool renameRenumbered(const String &folder, const String &name) {
     if (strlen(other) > 4 && isdigit(other[0]) && isdigit(other[1]) && isdigit(other[2]) && other[3] == ' ' && !strcmp(other + 4, tail)) { found = other; break; }
   }
   closedir(dir);
-  return found.length() && SD.rename(folder + "/" + found, folder + "/" + name);
+  if (!found.length() || !SD.rename(folder + "/" + found, folder + "/" + name)) return false;
+  for (const char *kind : {".lrc", ".nolrc"}) {  // Its lyrics follow it.
+    const String from = folder + "/" + found.substring(0, found.length() - 4) + kind;
+    if (SD.exists(from)) SD.rename(from, folder + "/" + name.substring(0, name.length() - 4) + kind);
+  }
+  return true;
 }
 
 bool numbered(const char *name) {
@@ -585,7 +592,11 @@ int moveRemoved(const String &folder, const String &manifest, int total) {
     }
     if (stray.length()) {
       SD.remove(bin + "/" + stray);
-      if (SD.rename(folder + "/" + stray, bin + "/" + stray)) { moved++; again = true; }
+      if (SD.rename(folder + "/" + stray, bin + "/" + stray)) {
+        moved++; again = true;
+        const String stem = stray.substring(0, stray.length() - 4);
+        for (const char *kind : {".lrc", ".nolrc"}) { SD.remove(bin + "/" + stem + kind); SD.rename(folder + "/" + stem + kind, bin + "/" + stem + kind); }
+      }
     }
   }
   return moved;
@@ -645,6 +656,76 @@ int writeManifest(const String &playlistId, const String &folder, const String &
   return syncStop ? -1 : count;
 }
 
+// ---- Lyrics for the synced songs ----
+// Each song's timed lyrics from Navidrome (getLyricsBySongId, its sidecar .lrc from wolfpack-sync's
+// timing pass) beside it on the card as "<song>.lrc"; a song with no timed lyrics gets an empty
+// "<song>.nolrc" so it isn't asked again. Once a day every song is asked again, since the timing
+// pass replaces LRCLIB's times with ones measured on our recording.
+constexpr int kLyricsPerPass = 40;
+String songStem(const String &name) { return name.substring(0, name.length() - 4); }
+
+bool fetchLyrics(const String &id, const String &folder, const String &name) {
+  JsonDocument filter, document;
+  filter["subsonic-response"]["lyricsList"]["structuredLyrics"][0]["synced"] = true;
+  filter["subsonic-response"]["lyricsList"]["structuredLyrics"][0]["line"][0]["start"] = true;
+  filter["subsonic-response"]["lyricsList"]["structuredLyrics"][0]["line"][0]["value"] = true;
+  if (!fetch(apiUrl("getLyricsBySongId") + "&id=" + urlEncode(id), filter, document)) return false;
+  const String stem = folder + "/" + songStem(name);
+  JsonArrayConst timed;
+  for (JsonObjectConst lyrics : document["subsonic-response"]["lyricsList"]["structuredLyrics"].as<JsonArrayConst>())
+    if (lyrics["synced"] | false) { timed = lyrics["line"].as<JsonArrayConst>(); break; }
+  if (timed.isNull() || timed.size() == 0) {
+    SD.remove(stem + ".lrc");
+    if (!SD.exists(stem + ".nolrc")) { File none = SD.open(stem + ".nolrc", FILE_WRITE); if (none) none.close(); }
+    return true;
+  }
+  File out = SD.open(stem + ".lrc.new", FILE_WRITE);
+  if (!out) return false;
+  for (JsonObjectConst line : timed) {
+    const uint32_t ms = line["start"] | 0;
+    out.printf("[%02lu:%02lu.%02lu]%s\n", static_cast<unsigned long>(ms / 60000), static_cast<unsigned long>(ms / 1000 % 60),
+               static_cast<unsigned long>(ms / 10 % 100), line["value"] | "");
+  }
+  out.close();
+  SD.remove(stem + ".nolrc");
+  SD.remove(stem + ".lrc");
+  return SD.rename(stem + ".lrc.new", stem + ".lrc");
+}
+
+void syncLyrics(const String &folder, const String &manifest) {
+  // Which day the last full ask was: the clock is seeded from the build, so a day is only trusted once
+  // the clock looks like it was set (after the build's own day).
+  const time_t now = time(nullptr);
+  const long today = now > 1790000000 ? static_cast<long>(now / 86400) : -1;
+  long asked = -2;
+  if (File day = SD.open(folder + "/.lyrics-day", FILE_READ)) { asked = day.readStringUntil('\n').toInt(); day.close(); }
+  const bool everySong = today >= 0 && asked != today;
+  int fetched = 0;
+  size_t offset = 0;
+  bool complete = true;
+  while (!syncStop) {
+    File list = SD.open(manifest, FILE_READ);
+    if (!list) break;
+    list.seek(offset);
+    if (!list.available()) { list.close(); break; }
+    const String line = list.readStringUntil('\n');
+    offset = list.position();
+    list.close();
+    const int tab = line.indexOf('\t');
+    if (tab <= 0) continue;
+    const String id = line.substring(0, tab), name = line.substring(tab + 1);
+    const String stem = folder + "/" + songStem(name);
+    if (!SD.exists(folder + "/" + name)) continue;
+    if (!everySong && (SD.exists(stem + ".lrc") || SD.exists(stem + ".nolrc"))) continue;
+    if (fetched >= kLyricsPerPass) { complete = false; break; }
+    if (!fetchLyrics(id, folder, name)) { complete = false; break; }
+    fetched++;
+  }
+  if (everySong && complete && !syncStop) {
+    if (File day = SD.open(folder + "/.lyrics-day", FILE_WRITE)) { day.println(today); day.close(); }
+  }
+}
+
 // One song, into a hidden file first, renamed only once every byte is there.
 bool download(const String &id, const String &folder, const String &name) {
   const String part = folder + "/.part.mp3";
@@ -675,6 +756,10 @@ bool download(const String &id, const String &folder, const String &name) {
     if (got <= 0) continue;
     if (out.write(buffer, got) != static_cast<size_t>(got)) { ok = false; syncState = "CARD FULL"; break; }
     written += got; lastData = millis();
+    // A tick back to the core after every chunk: with data always waiting (a fast network) the loop never
+    // reached the delay above, starved core 0's idle task, and the watchdog restarted the device after
+    // 5 s (runtime emulator card-sync through a local server, 2026-11-22). Costs at most 1 ms a chunk.
+    vTaskDelay(1);
   }
   out.close();
   http.end();
@@ -684,23 +769,16 @@ bool download(const String &id, const String &folder, const String &name) {
   return SD.rename(part, folder + "/" + name);
 }
 
-void syncPass() {
-  syncDone = 0; syncMissing = 0;
-  if (!configured()) { syncState = "SERVER NOT SET UP"; return; }
-  if (WiFi.status() != WL_CONNECTED) { syncState = "NO WIFI"; return; }
-  if (!SD.exists("/")) { syncState = "NO CARD"; return; }
-  syncState = "LOOKING";
-  JsonDocument filter, document;
-  filter["subsonic-response"]["playlists"]["playlist"][0]["id"] = true;
-  filter["subsonic-response"]["playlists"]["playlist"][0]["name"] = true;
-  if (!fetch(apiUrl("getPlaylists"), filter, document)) { syncState = failureText; return; }
-  String playlistId, playlistName;
-  for (JsonObjectConst list : document["subsonic-response"]["playlists"]["playlist"].as<JsonArrayConst>()) {
-    const String name = list["name"] | "";
-    if (name.equalsIgnoreCase(kUser)) { playlistId = list["id"] | ""; playlistName = name; }
-  }
-  document.clear();
-  if (playlistId.isEmpty()) { syncState = "NO PLAYLIST"; return; }
+// The shared alarm sounds: a public playlist of this name (tools/sd-cards/ringtones.py), mirrored into
+// /music/Sonneries beside the owner's songs, where the alarm's sound picker shows it first.
+constexpr char kRingtonesPlaylist[] = "Sonneries";
+
+// One playlist into /music/<name>: the manifest, renames, downloads (shared cap with the pass), removed
+// songs moved aside, then the owner's lyrics. Leaves syncState as UP TO DATE, MORE TO GET, PAUSED or a failure.
+void syncPlaylist(const String &playlistId, const String &playlistName, bool ringtones) {
+  syncMissing = 0; syncDone = 0;
+  // Ringtones are a few seconds each (about 110 KB): all of them in one pass.
+  const int cap = ringtones ? 40 : kSyncSongsPerPass;
   String folder;
   safeName(playlistName.c_str(), folder);
   folder = "/music/" + folder;
@@ -709,7 +787,7 @@ void syncPass() {
   const String manifest = folder + "/.sync.txt";
   const int total = writeManifest(playlistId, folder, manifest);
   if (total < 0) return;
-  syncTotal = total;
+  if (!ringtones) syncTotal = total;
   // Count what's missing first, so STATUS can say how many are left.
   int missing = 0;
   {
@@ -722,7 +800,12 @@ void syncPass() {
     if (list) list.close();
   }
   syncMissing = missing;
-  if (!missing) { moveRemoved(folder, manifest, total); syncState = "UP TO DATE"; return; }
+  if (!missing) {
+    moveRemoved(folder, manifest, total);
+    if (!ringtones) { syncState = "LYRICS"; syncLyrics(folder, manifest); }
+    if (!syncStop) syncState = "UP TO DATE";
+    return;
+  }
   syncState = "GETTING";
   File list = SD.open(manifest, FILE_READ);
   size_t offset = 0;
@@ -736,20 +819,54 @@ void syncPass() {
     if (tab <= 0) continue;
     const String id = line.substring(0, tab), name = line.substring(tab + 1);
     if (onCard(folder + "/" + name)) continue;
-    if (syncDone >= kSyncSongsPerPass) { syncState = "MORE TO GET"; break; }
+    if (syncDone >= cap) { syncState = "MORE TO GET"; break; }
     // The card file stays closed while a song downloads: two open files is RAM the player may want.
     list.close();
     if (renameRenumbered(folder, name)) { syncDone = syncDone + 1; }
     else {
       const bool got = download(id, folder, name);
-      if (got) { syncDone = syncDone + 1; syncAdded = syncAdded + 1; }
+      if (got) {
+        syncDone = syncDone + 1;
+        if (!ringtones) syncAdded = syncAdded + 1;
+        if (!ringtones && syncNamesListed < 6) { if (syncAddedNames.length()) syncAddedNames += ", "; syncAddedNames += name.substring(4, name.length() - 4); syncNamesListed++; }
+      }
       else failed = true;
     }
     list = SD.open(manifest, FILE_READ);
   }
   if (list) list.close();
   if (syncStop) syncState = "PAUSED";
-  else if (!failed && strcmp(syncState, "MORE TO GET")) { moveRemoved(folder, manifest, total); syncState = "UP TO DATE"; }
+  else if (!failed && strcmp(syncState, "MORE TO GET")) {
+    moveRemoved(folder, manifest, total);
+    if (!ringtones) { syncState = "LYRICS"; syncLyrics(folder, manifest); }
+    syncState = syncStop ? "PAUSED" : "UP TO DATE";
+  }
+}
+
+void syncPass() {
+  syncDone = 0; syncMissing = 0;
+  if (!configured()) { syncState = "SERVER NOT SET UP"; return; }
+  if (WiFi.status() != WL_CONNECTED) { syncState = "NO WIFI"; return; }
+  if (!SD.exists("/")) { syncState = "NO CARD"; return; }
+  syncState = "LOOKING";
+  JsonDocument filter, document;
+  filter["subsonic-response"]["playlists"]["playlist"][0]["id"] = true;
+  filter["subsonic-response"]["playlists"]["playlist"][0]["name"] = true;
+  if (!fetch(apiUrl("getPlaylists"), filter, document)) { syncState = failureText; return; }
+  String playlistId, playlistName, ringtonesId;
+  for (JsonObjectConst list : document["subsonic-response"]["playlists"]["playlist"].as<JsonArrayConst>()) {
+    const String name = list["name"] | "";
+    if (name.equalsIgnoreCase(kUser)) { playlistId = list["id"] | ""; playlistName = name; }
+    else if (name == kRingtonesPlaylist) ringtonesId = list["id"] | "";
+  }
+  document.clear();
+  if (playlistId.length()) syncPlaylist(playlistId, playlistName, false);
+  else syncState = "NO PLAYLIST";
+  const bool ownDone = !strcmp(syncState, "UP TO DATE") || !strcmp(syncState, "NO PLAYLIST");
+  if (!ownDone || syncStop || ringtonesId.isEmpty()) return;
+  const char *own = syncState;
+  syncPlaylist(ringtonesId, kRingtonesPlaylist, true);
+  if (!strcmp(syncState, "UP TO DATE")) syncState = own;  // The owner's songs are what STATUS talks about.
 }
 
 void syncTask(void *) {
@@ -783,11 +900,22 @@ bool cardSyncRunning() { return syncHandle != nullptr; }
 void cardSyncText(char *text, size_t size) {
   const char *state = syncState;
   if (!strcmp(state, "GETTING") || !strcmp(state, "MORE TO GET")) snprintf(text, size, "GETTING %d OF %d", syncDone + 1, syncMissing);
+  else if (!strcmp(state, "LYRICS")) snprintf(text, size, "%d SONGS, GETTING LYRICS", syncTotal);
   else if (!strcmp(state, "UP TO DATE") && syncTotal >= 0) snprintf(text, size, "%d SONGS, UP TO DATE", syncTotal);
   else snprintf(text, size, "%s", state);
 }
 
 int takeCardSyncAdded() { const int added = syncAdded; syncAdded = 0; return added; }
+
+bool isOwnSongsFolder(const String &folderName) { return kUser[0] && folderName.equalsIgnoreCase(kUser); }
+bool isRingtonesFolder(const String &folderName) { return folderName == kRingtonesPlaylist; }
+
+String takeCardSyncAddedNames() {
+  String names = syncAddedNames;
+  if (syncAdded > syncNamesListed) names += " +" + String(syncAdded - syncNamesListed);
+  syncAddedNames = ""; syncNamesListed = 0;
+  return names;
+}
 
 bool begin() {
   // Wanted again before it had ended: it just carries on.

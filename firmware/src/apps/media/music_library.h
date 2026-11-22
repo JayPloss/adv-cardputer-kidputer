@@ -65,6 +65,11 @@ bool cardSyncRunning();
 void cardSyncText(char *text, size_t size);
 // Songs added since the last call, for a notice on HOME.
 int takeCardSyncAdded();
+// Their names ("Title - Artist", comma separated, the first six and how many more), cleared by the call.
+String takeCardSyncAddedNames();
+// The card folder card sync fills with the owner's playlist ("Andrew"), and the shared alarm sounds'.
+bool isOwnSongsFolder(const String &folderName);
+bool isRingtonesFolder(const String &folderName);
 
 Status status();
 const char *failure();

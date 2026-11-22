@@ -72,7 +72,11 @@ const char *failureText(const char *english) {
   if (frenchUi) for (const auto &pair : kFrench) if (!strcmp(english, pair[0])) return pair[1];
   return english;
 }
-constexpr char kFirmwareVersion[] = "v0.61";
+constexpr char kFirmwareVersion[] = "v0.62";
+// The author of the device's own notes to its owner: no account has this id.
+constexpr char kNoticeAuthor[] = "kidputer";
+// Lyrics show only when asked for: L (lyrics) in English, P (paroles) in French, turns them on and off; remembered.
+bool lyricsWanted = false;
 constexpr size_t kMessageLimit = 140;
 constexpr size_t kHistoryLimit = 100;  // What the first sync fetches; older pages go to the card.
 constexpr size_t kRamMessageLimit = 40;
@@ -248,6 +252,7 @@ struct ChatLine {
   bool showSender;
   bool selected;
   int8_t mark;  // -1, or on the last line of a message of ours: see MessageMark.
+  bool notice;  // A note from the device to its owner (postNotice): cyan, seen by nobody else.
 };
 // How far a message of ours has got, drawn at the right of its last line.
 enum MessageMark : int8_t { MarkSending, MarkHeardNearby, MarkOnServer, MarkDelivered, MarkRead, MarkFailed };
@@ -890,6 +895,21 @@ void saveHistoryLocked() {
   SD.rename(temporaryPath, path);
 }
 
+// A note from the device to its owner, in the chat they're looking at: "new songs on your card", and
+// whatever comes next. It's kept on the card with the room's history like any message, never sent,
+// never synced, and nobody else sees it. Its author is kNoticeAuthor; chat draws it cyan, named in magenta.
+void postNotice(const String &body) {
+  if (!stateMutex) return;
+  ChatMessage message;
+  message.roomId = currentRoomId.get(); message.clientId = "notice-" + String(millis()) + "-" + String(esp_random() & 0xffff, HEX);
+  message.authorId = kNoticeAuthor; message.authorName = "KIDPUTER"; message.body = body; message.state = "local";
+  time_t now = time(nullptr); message.createdAt = static_cast<int64_t>(now) * 1000;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  messages.push_back(message); trimHistory(); saveHistoryLocked();
+  xSemaphoreGive(stateMutex);
+  messageNotificationPending = true; renderDirty = true;
+}
+
 void loadHistoryFile();
 void loadHistory() { loadHistoryFile(); reconcileOutboxLocked(); }
 void loadHistoryFile() {
@@ -935,6 +955,7 @@ void loadConfiguration() {
     preferences.putBool("high_default", true);
   }
   persistedBatteryLevel = preferences.getInt("battery_soc", -1);
+  lyricsWanted = preferences.getBool("lyrics", false);
   if (persistedBatteryLevel < 0 || persistedBatteryLevel > 100) persistedBatteryLevel = -1;
   const int count = preferences.getUChar("wifi_count", 0);
   for (int index = 0; index < count && index < 12; index++) {
@@ -2451,7 +2472,8 @@ void drawChat() {
   for (int index = first; index < end; index++) {
     const auto &message = messages[index];
     const bool mine = message.authorId == kDeviceId;
-    const uint32_t colour = participantColour(message.authorId, message.authorName);
+    const bool notice = message.authorId == kNoticeAuthor;
+    const uint32_t colour = notice ? 0xFF5CF0 : participantColour(message.authorId, message.authorName);  // RGB888, as participantColour
     const String sender = (message.authorName.isEmpty() ? message.authorId : message.authorName).substring(0, 12);
     String text = message.voice ? String("[voice message]") : message.body;
     bool firstChunk = true;
@@ -2462,7 +2484,7 @@ void drawChat() {
       String line = text.substring(0, split);
       text = text.substring(split);
       while (text.startsWith(" ")) text.remove(0, 1);
-      lines.push_back({line, sender, colour, mine, firstChunk, historyOffset > 0 && index == end - 1, -1});
+      lines.push_back({line, sender, colour, mine, firstChunk, historyOffset > 0 && index == end - 1, -1, notice});
       firstChunk = false;
     }
     if (mine && !lines.empty()) {
@@ -2503,6 +2525,7 @@ void drawChat() {
       display.setTextColor(lines[index].colour, lineBackground); printFont0Text(lines[index].sender);
       display.setTextColor(TFT_WHITE, lineBackground); display.print(": ");
     } else display.setTextColor(TFT_WHITE, lineBackground);
+    if (lines[index].notice) display.setTextColor(TFT_CYAN, lineBackground);
     printChatText(lines[index].text);
     drawMessageMark(lines[index].mark, y);
     y += 17;
@@ -2895,34 +2918,119 @@ void drawLibrarySearch() {
   display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 123); display.print(uiText("TYPE  ENTER SEARCH  MENU BACK", "TAPER ENTER CHERCHER MENU RETOUR"));
 }
 
+// Lyrics of the song playing from the card: its "<song>.lrc" (card sync puts it there), read once when the
+// song starts. Times and lines only, about 3 KB for a song; a file past the caps isn't shown at all, since
+// a song's lyrics shown in part would look like the rest is missing.
+struct LyricLine { uint32_t ms; String text; };
+std::vector<LyricLine> lyricLines;
+int lyricShown = -1;
+constexpr size_t kLyricMaxLines = 160;
+constexpr size_t kLyricMaxBytes = 8192;
+
+void clearLyrics() { std::vector<LyricLine>().swap(lyricLines); lyricShown = -1; }
+
+void loadLyrics(const String &songPath) {
+  clearLyrics();
+  if (!sdReady || !songPath.endsWith(".mp3")) return;
+  File file = SD.open(songPath.substring(0, songPath.length() - 4) + ".lrc", FILE_READ);
+  if (!file) return;
+  if (file.size() > kLyricMaxBytes) { file.close(); return; }
+  try {
+    while (file.available() && lyricLines.size() < kLyricMaxLines) {
+      String line = file.readStringUntil('\n');
+      line.trim();
+      unsigned minutes = 0, seconds = 0, hundredths = 0;
+      // [mm:ss.xx]text; [ar:..] and other tags don't parse and are skipped.
+      if (line.length() < 10 || line[0] != '[' || sscanf(line.c_str(), "[%u:%u.%u]", &minutes, &seconds, &hundredths) != 3) continue;
+      const int close = line.indexOf(']');
+      const String text = line.substring(close + 1);
+      if (text.isEmpty()) continue;
+      lyricLines.push_back({(minutes * 60 + seconds) * 1000 + hundredths * 10, text});
+    }
+  } catch (const std::bad_alloc &) { clearLyrics(); }
+  file.close();
+}
+
+// The line being sung: the last one whose time has come.
+int currentLyric(uint32_t ms) {
+  int found = -1;
+  for (int index = 0; index < static_cast<int>(lyricLines.size()) && lyricLines[index].ms <= ms; index++) found = index;
+  return found;
+}
+
+// Up to three lines of `text` at Font0 x2 (19 characters each), broken at spaces: 57 characters, more
+// than any line in the kids' playlists (longest 52). A longer one ends in "~".
+constexpr int kLyricRows = 3;
+void wrapLyric(const String &text, String rows[kLyricRows]) {
+  String rest = text;
+  for (int row = 0; row < kLyricRows; row++) {
+    rows[row] = "";
+    if (rest.isEmpty()) continue;
+    if (utf8CharacterCount(rest) <= 19) { rows[row] = rest; rest = ""; continue; }
+    String head = utf8Head(rest, 19);
+    const int space = head.lastIndexOf(' ');
+    if (space > 4) head = head.substring(0, space);
+    rows[row] = head;
+    rest = rest.substring(head.length()); rest.trim();
+  }
+  if (!rest.isEmpty()) rows[kLyricRows - 1] = utf8Head(rows[kLyricRows - 1], 18) + "~";
+}
+
 void drawNowPlaying() {
   auto &display = uiCanvas; display.fillScreen(TFT_BLACK); drawHeader(queueCollection == library::Collection::Books ? uiText("BOOKS", "LIVRES") : uiText("MUSIC", "MUSIQUE"));
   const auto *item = nowPlayingItem();
   if (!item) return;
   const auto state = media::state();
-  display.setTextColor(TFT_WHITE, TFT_BLACK); display.setCursor(6, 28); printFont0Text(utf8Head(item->title, 38));
-  display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 42); printFont0Text(utf8Head(item->detail, 38));
   const uint32_t position = media::positionSeconds();
   const uint32_t duration = item->seconds ? item->seconds : media::durationSeconds();
-  display.drawRoundRect(6, 60, 228, 8, 3, TFT_DARKGREY);
-  if (duration) display.fillRoundRect(7, 61, std::min<uint64_t>(226, 226ULL * position / duration), 6, 2, TFT_GREEN);
-  display.setTextColor(TFT_WHITE, TFT_BLACK); display.setCursor(6, 74); display.print(clockText(position));
-  const String total = clockText(duration); display.setCursor(234 - static_cast<int>(total.length()) * 6, 74); display.print(total);
-  display.setCursor(6, 92);
+  int stateY = 92;
+  if (lyricsWanted && !lyricLines.empty()) {
+    // Lyrics: the line being sung at Font0 x2 on up to three rows, the next line x1 grey under it. The
+    // title shares its row with the play state, a thin bar shows where the song is, the times give way.
+    display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 24); printFont0Text(utf8Head(item->title, 27));
+    display.drawRoundRect(6, 35, 228, 6, 2, TFT_DARKGREY);
+    if (duration) display.fillRoundRect(7, 36, std::min<uint64_t>(226, 226ULL * position / duration), 4, 1, TFT_GREEN);
+    lyricShown = currentLyric(media::positionMs());
+    String rows[kLyricRows];
+    if (lyricShown >= 0) wrapLyric(lyricLines[lyricShown].text, rows);
+    display.setTextSize(2); display.setTextColor(TFT_WHITE, TFT_BLACK);
+    for (int row = 0; row < kLyricRows; row++) { display.setCursor(6, 45 + row * 18); printFont0Text(rows[row]); }
+    display.setTextSize(1);
+    const int after = lyricShown + 1;
+    if (after < static_cast<int>(lyricLines.size())) { display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 100); printFont0Text(utf8Head(lyricLines[after].text, 38)); }
+    stateY = 24;
+  } else {
+    display.setTextColor(TFT_WHITE, TFT_BLACK); display.setCursor(6, 28); printFont0Text(utf8Head(item->title, 38));
+    display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 42); printFont0Text(utf8Head(item->detail, 38));
+    display.drawRoundRect(6, 60, 228, 8, 3, TFT_DARKGREY);
+    if (duration) display.fillRoundRect(7, 61, std::min<uint64_t>(226, 226ULL * position / duration), 6, 2, TFT_GREEN);
+    display.setTextColor(TFT_WHITE, TFT_BLACK); display.setCursor(6, 74); display.print(clockText(position));
+    const String total = clockText(duration); display.setCursor(234 - static_cast<int>(total.length()) * 6, 74); display.print(total);
+  }
+  const bool lyricsShown = lyricsWanted && !lyricLines.empty();
+  display.setCursor(lyricsShown ? 174 : 6, stateY);
   if (state == media::State::Failed) { display.setTextColor(TFT_RED, TFT_BLACK); display.print(failureText(media::failure())); }
   else {
     display.setTextColor(TFT_YELLOW, TFT_BLACK);
     display.print(state == media::State::Connecting ? uiText("BUFFERING", "CHARGEMENT") : state == media::State::Paused ? uiText("PAUSED", "EN PAUSE") : state == media::State::Playing ? uiText("PLAYING", "LECTURE") : uiText("STOPPED", "ARRET"));
   }
+  // With lyrics, the sleep timer, like and volume share the first hint row, whose hint gets shorter.
+  const int infoY = lyricsShown ? 110 : stateY;
   if (sleepTimer.on) {
-    display.setCursor(72, 92); display.setTextColor(TFT_CYAN, TFT_BLACK);
+    display.setCursor(lyricsShown ? 102 : 72, infoY); display.setTextColor(TFT_CYAN, TFT_BLACK);
     display.print(uiText("SLEEP ", "DODO ")); display.print(clockText(sleepTimer.leftSeconds(millis())));
   }
-  display.setCursor(178, 92); display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.print(kVolumeNames[volumeLevel]);
-  if (item->liked) { display.setCursor(160, 92); display.setTextColor(TFT_YELLOW, TFT_BLACK); display.print("*"); }
+  display.setCursor(lyricsShown ? 190 : 178, infoY); display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.print(kVolumeNames[volumeLevel]);
+  if (item->liked) { display.setCursor(lyricsShown ? 178 : 160, infoY); display.setTextColor(TFT_YELLOW, TFT_BLACK); display.print("*"); }
   display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  display.setCursor(6, 110); display.print(queueCollection == library::Collection::Books ? uiText("LEFT/RIGHT 30s    UP/DOWN VOL", "GAUCHE/DROITE 30s HAUT/BAS VOL") : uiText("LEFT/RIGHT SONG   UP/DOWN VOL", "GAUCHE/DROITE     HAUT/BAS VOL"));
-  display.setCursor(6, 123); display.print(queueCollection == library::Collection::Books ? uiText("ENTER PAUSE  T SLEEP  S STOP", "ENTER PAUSE  T DODO  S ARRET") : uiText("ENTER PAUSE L LIKE T SLEEP S STOP", "ENTER PAUSE L AIME T DODO S ARRET"));
+  display.setCursor(6, 110);
+  const bool lyricsHere = queueCollection == library::Collection::Music && !lyricLines.empty();
+  if (lyricsShown) display.print(uiText("LEFT/RIGHT SONG", "GAUCHE/DROITE"));
+  else if (lyricsHere) display.print(uiText("LEFT/RIGHT SONG UP/DOWN VOL L LYRICS", "GAUCHE/DROITE HAUT/BAS VOL P PAROLES"));
+  else display.print(queueCollection == library::Collection::Books ? uiText("LEFT/RIGHT 30s    UP/DOWN VOL", "GAUCHE/DROITE 30s HAUT/BAS VOL") : uiText("LEFT/RIGHT SONG   UP/DOWN VOL", "GAUCHE/DROITE     HAUT/BAS VOL"));
+  display.setCursor(6, 123);
+  if (lyricsShown) display.print(uiText("ENTER PAUSE  L LYRICS  S STOP", "ENTER PAUSE  P PAROLES  S STOP"));
+  else display.print(queueCollection == library::Collection::Books ? uiText("ENTER PAUSE  T TIMER  S STOP", "ENTER PAUSE  T MINUTERIE  S STOP") : uiText("ENTER PAUSE F FAVOURITE T TIMER S STOP", "ENTER PAUSE A AIME T MINUTERIE S STOP"));
 }
 
 void drawSystem() {
@@ -3057,6 +3165,9 @@ constexpr int kAlarmSoundX = 218;
 String alarmSongTitle(const String &path) {
   String title = path.substring(path.lastIndexOf('/') + 1);
   if (title.endsWith(".mp3")) title.remove(title.length() - 4);
+  // Card sync's "007 Title - Artist": the number means nothing on the alarm, nor a ringtone's "- Android".
+  if (title.length() > 4 && isdigit(title[0]) && isdigit(title[1]) && isdigit(title[2]) && title[3] == ' ') title.remove(0, 4);
+  if (path.indexOf("/Sonneries/") >= 0 && title.lastIndexOf(" - ") > 0) title.remove(title.lastIndexOf(" - "));
   return title;
 }
 
@@ -3414,7 +3525,7 @@ bool handleAlarmKeys(const Keyboard_Class::KeysState &keys, int digit, bool goUp
     if (!alarms.add()) { bumpAlarm(); return false; }
     alarmRow = alarms.count - 1; alarmColumn = AlarmColumn::Time; alarmTyped.clear(); alarmSounds[alarmRow] = "";
     editAlarm(alarmRow, alarms.entries[alarmRow].hour, alarms.entries[alarmRow].minute);
-    if (digit >= 0) alarmTyped.push(digit);
+    if (digit >= 0 && !alarmTyped.accept(digit)) bumpAlarm();
     return true;
   }
   clockapps::AlarmEntry &entry = alarms.entries[alarmRow];
@@ -3437,7 +3548,7 @@ bool handleAlarmKeys(const Keyboard_Class::KeysState &keys, int digit, bool goUp
   if (digit >= 0) {
     // A digit on a switch types the time too.
     alarmColumn = AlarmColumn::Time;
-    alarmTyped.push(digit);
+    if (!alarmTyped.accept(digit)) { bumpAlarm(); return false; }
     if (alarmTyped.full()) {
       if (!alarmTyped.valid()) { bumpAlarm(); return false; }
       commitAlarmTyping();
@@ -3687,7 +3798,19 @@ String font0Cp437Text(const String &text) {
       else if (first == 0xC2) slot = second == 0xAB ? 0xAE : second == 0xBB ? 0xAF : second == 0xB0 ? 0xF8 : second == 0xA8 ? '"' : 0;
       if (slot) { encoded += static_cast<char>(slot); index++; continue; }
     }
-    encoded += static_cast<char>(first);
+    if (first < 0x80) { encoded += static_cast<char>(first); continue; }
+    // Any other character takes exactly one cell, as utf8Head and the layouts count it: a curly quote's three
+    // bytes drawn as three glyphs ran song names off the screen (runtime emulator card-sync, 2026-11-21).
+    const int length = first >= 0xF0 ? 4 : first >= 0xE0 ? 3 : first >= 0xC0 ? 2 : 1;
+    uint32_t code = length == 4 ? first & 0x07 : length == 3 ? first & 0x0F : length == 2 ? first & 0x1F : '?';
+    for (int extra = 1; extra < length && index + 1 < text.length(); extra++) code = (code << 6) | (static_cast<uint8_t>(text[++index]) & 0x3F);
+    char shown = '?';
+    if (code == 0x2018 || code == 0x2019 || code == 0x02BC) shown = '\'';
+    else if (code == 0x201C || code == 0x201D) shown = '"';
+    else if (code == 0x2013 || code == 0x2014 || code == 0x2010 || code == 0x2011) shown = '-';
+    else if (code == 0x00A0 || code == 0x202F || code == 0x2009) shown = ' ';
+    else if (code == 0x2026) shown = '.';
+    encoded += shown;
   }
   return encoded;
 }
@@ -3953,6 +4076,7 @@ void switchRoom(int direction) {
 
 String trackPath(const library::Item &item) { return queueFolder + "/" + item.title + ".mp3"; }
 
+
 void savePlace() {
   const auto *item = nowPlayingItem();
   // While an alarm's song plays, the player's position is the song's, not the book's.
@@ -4048,6 +4172,7 @@ void startQueuedTrack(uint32_t offsetSeconds) {
     lastCardMediaAt = millis();
     for (const uint32_t started = millis(); !radioIsOff && millis() - started < kRadioOffWaitMs;) delay(10);
   }
+  if (queueCollection == library::Collection::Music && item->onCard) loadLyrics(trackPath(*item)); else clearLyrics();
   if (item->onCard) media::playFile(trackPath(*item), offsetSeconds);
   else media::play(library::streamUrl(item->id, queueCollection, offsetSeconds), offsetSeconds);
   mediaStarting = false;
@@ -4324,9 +4449,13 @@ void serviceCardSync() {
   const bool running = library::cardSyncRunning();
   if (cardSyncWasRunning && !running) {
     char text[40]; library::cardSyncText(text, sizeof text);
+    Serial.printf("CARDSYNC pass ended: %s\n", text);
     nextCardSyncAt = millis() + (strstr(text, "UP TO DATE") || strstr(text, "NO PLAYLIST") ? kCardSyncEveryMs
                                  : strstr(text, "GETTING") || strstr(text, "BUSY") ? kCardSyncMoreMs : kCardSyncRetryMs);
-    cardSyncNews += library::takeCardSyncAdded();
+    const String names = library::takeCardSyncAddedNames();  // Before the count: it adds "+N" from it.
+    const int added = library::takeCardSyncAdded();
+    cardSyncNews += added;
+    if (added > 0) postNotice(String(added == 1 ? uiText("New song on your card: ", "Nouvelle chanson sur ta carte : ") : uiText("New songs on your card: ", "Nouvelles chansons sur ta carte : ")) + names);
   }
   // Said on HOME once someone is there to read it, not under the idle clock; passes add up.
   if (cardSyncNews > 0 && screenMode == ScreenMode::Home && !idleClockShown && homeNotice.isEmpty()) {
@@ -4340,6 +4469,7 @@ void serviceCardSync() {
   if (static_cast<int32_t>(millis() - nextCardSyncAt) < 0) return;
   // Only when the connection broker has room: the pass's task and socket fit beside nothing else.
   if (os::secureHeld() || !os::secureFits()) return;  // Room for its task too, not just its connection.
+  Serial.println("CARDSYNC pass starts");
   library::startCardSync();
   cardSyncWasRunning = true;
 }
@@ -4356,7 +4486,7 @@ void serviceApps() {
   if (screenMode == ScreenMode::Home && !libraryItems.empty()) { std::vector<library::Item>().swap(libraryItems); renderDirty = true; }
   // And with nothing playing, the tasks too: their stacks are chat's room for a connection.
   if (front != os::mediaOwner() && !media::active() && !mediaStarting) {
-    media::end(); library::end(); mediaTasksWanted = false; os::holdSecure(false);
+    media::end(); library::end(); mediaTasksWanted = false; os::holdSecure(false); clearLyrics();
     os::reconcile(os::Owner::Music); os::reconcile(os::Owner::Books);
   } else if (mediaTasksWanted && !os::secureHeld() && !library::cardSyncRunning()) {
     if (!library::begin() || !media::begin()) os::recordFault(os::mediaOwner(), "no RAM to start");
@@ -4383,8 +4513,18 @@ void serviceMedia() {
   if (library::takeItems(libraryItems)) {
     // Choosing an alarm's song: the beeps come first.
     if (alarmSoundPick >= 0 && libraryView == LibraryView::CardAlbums) {
+      // Choosing an alarm's sound: the beeps, the shared ringtones, the owner's songs (named for what they
+      // are, not after the owner: Andrew saw "Andrew", Jay 2026-11-21), then any other folder.
+      std::vector<library::Item> front;
       library::Item beeps; beeps.title = uiText("BEEPS (NO SONG)", "BIPS (SANS CHANSON)");
-      libraryItems.insert(libraryItems.begin(), beeps);
+      front.push_back(beeps);
+      for (const bool ringtones : {true, false})
+        for (auto item = libraryItems.begin(); item != libraryItems.end(); ++item)
+          if (ringtones ? library::isRingtonesFolder(item->title) : library::isOwnSongsFolder(item->title)) {
+            item->title = ringtones ? uiText("RINGTONES", "SONNERIES") : uiText("SONGS", "CHANSONS");
+            front.push_back(*item); libraryItems.erase(item); break;
+          }
+      libraryItems.insert(libraryItems.begin(), front.begin(), front.end());
     }
     // A list growing (the server's albums joining the card's) keeps the selection in place.
     if (!listHadItems) librarySelection = 0;
@@ -4426,6 +4566,7 @@ void serviceMedia() {
   }
   if (state != media::State::Playing) return;
   if (screenMode == ScreenMode::NowPlaying && millis() - lastMediaRenderAt >= 1000) { lastMediaRenderAt = millis(); renderDirty = true; }
+  if (screenMode == ScreenMode::NowPlaying && lyricsWanted && !lyricLines.empty() && currentLyric(media::positionMs()) != lyricShown) renderDirty = true;
   const auto *item = nowPlayingItem();
   if (item && queueCollection == library::Collection::Books && millis() - lastBookmarkAt >= kBookmarkEveryMs) {
     lastBookmarkAt = millis(); savePlace();
@@ -4511,7 +4652,12 @@ bool handleAppKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown
         sleepTimer.set(millis(), sleepTimer.nextStepMs(millis()));
         M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
       }
-      else if ((character == 'l' || character == 'L') && queueIndex >= 0 && queueCollection == library::Collection::Music) {
+      // Each key is the first letter of the word its hint shows: L LYRICS / P PAROLES, F FAVOURITE / A AIME.
+      else if (tolower(character) == (frenchUi ? 'p' : 'l') && queueCollection == library::Collection::Music) {
+        if (lyricLines.empty() && !lyricsWanted) bumpHome(0);  // This song has no timed lyrics: nothing to turn on.
+        else { lyricsWanted = !lyricsWanted; preferences.begin("supachat", false); preferences.putBool("lyrics", lyricsWanted); preferences.end(); }
+      }
+      else if (tolower(character) == (frenchUi ? 'a' : 'f') && queueIndex >= 0 && queueCollection == library::Collection::Music) {
         auto &item = playQueue[queueIndex];
         if (!item.onCard) { item.liked = !item.liked; library::setLiked(item.id, item.liked); }
       }

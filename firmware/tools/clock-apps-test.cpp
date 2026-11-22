@@ -90,6 +90,17 @@ int main() {
   entry.push(0); assert(entry.digits == 5730 && entry.count == 4 && !entry.valid());
   entry.clear(); for (int d : {2, 3, 5, 9}) entry.push(d); assert(entry.valid() && entry.hour() == 23 && entry.minute() == 59);
   assert(!Alarms::isTime(2400) && Alarms::isTime(2359));
+  // A digit that can't lead to a real time is refused (Andrew typed 0,0,6,7 and got 00:67, 2026-11-21).
+  entry.clear(); assert(entry.accept(0) && entry.accept(0) && entry.accept(6));
+  assert(!entry.accept(7) && entry.digits == 6 && entry.count == 3);  // 00:67 can never become a time
+  for (int d = 0; d <= 9; d++) assert(!entry.accept(d));             // 0,0,6,x is 00:6x: none is a time
+  assert(entry.valid() && entry.hour() == 0 && entry.minute() == 6);  // Enter still sets 00:06
+  entry.clear(); for (int d : {0, 6, 0, 7}) assert(entry.accept(d));   // passing 00:60 on the way to 06:07
+  assert(entry.valid() && entry.hour() == 6 && entry.minute() == 7);
+  entry.clear(); assert(entry.accept(7) && entry.accept(3) && entry.accept(0) && entry.digits == 730);  // 00:73 on the way to 07:30
+  entry.clear(); assert(entry.accept(2) && entry.accept(5) && entry.accept(7) && entry.digits == 257);   // 02:57
+  assert(!entry.accept(3) && entry.digits == 257);                                                        // 25:73 isn't a time
+
 
   // Stopwatch.
   Stopwatch watch; watch.toggle(100); watch.toggle(1100); assert(watch.elapsedMs(5000) == 1000);

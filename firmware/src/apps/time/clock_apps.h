@@ -179,6 +179,22 @@ struct TimeEntry {
     digits = static_cast<uint16_t>((digits % 1000) * 10 + digit);
     if (count < 4) count++;
   }
+  // Whether typing on from (digits, count) can still make a real time: 0-0-6-7 shows 00:67, and no
+  // digit after it fixes that (06:7x, then 67:xx). Andrew typed exactly that (Jay, 2026-11-21).
+  static bool reachable(uint16_t typed, uint8_t typedCount) {
+    if (Alarms::isTime(typed)) return true;
+    if (typedCount >= 4) return false;
+    for (int next = 0; next <= 9; next++)
+      if (reachable(static_cast<uint16_t>((typed % 1000) * 10 + next), static_cast<uint8_t>(typedCount + 1))) return true;
+    return false;
+  }
+  // A digit that can't lead to a real time is refused: false, and nothing changes.
+  bool accept(int digit) {
+    const uint16_t next = static_cast<uint16_t>((digits % 1000) * 10 + digit);
+    if (!reachable(next, static_cast<uint8_t>(count < 4 ? count + 1 : 4))) return false;
+    push(digit);
+    return true;
+  }
   bool undo() {
     if (!count) return false;
     digits /= 10; count--;
