@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import QRCode from 'qrcode';
+import { handleParentControls, initParentControls } from './parent-controls.mjs';
 
 const sourceRoot = dirname(fileURLToPath(import.meta.url));
 const webRoot = join(sourceRoot, '..', 'web');
@@ -21,6 +22,9 @@ const config = {
   authentikApiUrl: (process.env.SUPACHAT_AUTHENTIK_API_URL || 'https://auth.supachat.net/api/v3').replace(/\/$/, ''),
   authentikApiToken: process.env.SUPACHAT_AUTHENTIK_API_TOKEN || '',
   authentikInviteFlowId: process.env.SUPACHAT_AUTHENTIK_INVITE_FLOW_ID || '',
+  // Where the join page sends phones to install the app; empty means "use the web portal".
+  androidInstallUrl: process.env.SUPACHAT_ANDROID_INSTALL_URL || '',
+  iosInstallUrl: process.env.SUPACHAT_IOS_INSTALL_URL || '',
   expoPushEnabled: process.env.SUPACHAT_EXPO_PUSH_ENABLED === 'true',
   sessionSecret: process.env.SUPACHAT_SESSION_SECRET || '',
   papaPasswordHash: process.env.SUPACHAT_PAPA_PASSWORD_HASH || '',
@@ -215,6 +219,8 @@ db.exec(`CREATE TABLE IF NOT EXISTS device_preferences (
   language_override TEXT CHECK (language_override IN ('en','fr'))
 )`);
 
+initParentControls(db);
+
 const seed = db.prepare('INSERT OR IGNORE INTO users(id, display_name, short_name, kind) VALUES (?, ?, ?, ?)');
 seed.run('papa', 'Papa', 'Papa', 'web');
 seed.run('albie', 'Albie', 'Albie', 'device');
@@ -279,12 +285,17 @@ const assets = new Map([
   ['/app.js', ['text/javascript; charset=utf-8', readFileSync(join(webRoot, 'app.js'))]],
   ['/supachat-logo.png', ['image/png', readFileSync(join(webRoot, 'supachat-logo.png'))]],
   ['/policy.css', ['text/css; charset=utf-8', readFileSync(join(webRoot, 'policy.css'))]],
+  ['/manage.js', ['text/javascript; charset=utf-8', readFileSync(join(webRoot, 'manage.js'))]],
+  ['/join.js', ['text/javascript; charset=utf-8', readFileSync(join(webRoot, 'join.js'))]],
+  ['/manage.css', ['text/css; charset=utf-8', readFileSync(join(webRoot, 'manage.css'))]],
 ]);
 const loginHtml = readFileSync(join(webRoot, 'login.html'));
 const appHtml = readFileSync(join(webRoot, 'index.html'));
 const privacyHtml = readFileSync(join(webRoot, 'privacy.html'));
 const termsHtml = readFileSync(join(webRoot, 'terms.html'));
 const deleteAccountHtml = readFileSync(join(webRoot, 'delete-account.html'));
+const manageHtml = readFileSync(join(webRoot, 'manage.html'));
+const joinHtml = readFileSync(join(webRoot, 'join.html'));
 
 function json(res, status, value, headers = {}) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers });
@@ -699,6 +710,40 @@ setInterval(() => {
   for (const [roomId, speaker] of walkieSpeakers) if (Date.now() - speaker.startedAt > 30_000) releaseWalkie(roomId, speaker.user, 'timeout');
 }, 1000).unref();
 
+// A one-use Authentik enrollment for a person invited by a parent or a kid (parent-controls.mjs).
+// The username is fixed in the invitation; `next` brings them back to the join page to finish.
+async function mintEnrollment({ username, displayName, next }) {
+  const expiresAt = Date.now() + 7 * 24 * 60 * 60_000;
+  let invitation;
+  if (config.nativeTestToken) invitation = { pk: '00000000-0000-4000-8000-000000000002' };
+  else {
+    if (!config.authentikApiToken || !config.authentikInviteFlowId) return { status: 503, error: 'invites_not_configured' };
+    const response = await fetch(`${config.authentikApiUrl}/stages/invitation/invitations/`, {
+      method: 'POST', headers: { authorization: `Bearer ${config.authentikApiToken}`, 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ name: `supachat_join_${username}_${Date.now()}`, expires: new Date(expiresAt).toISOString(), fixed_data: { username, name: displayName }, single_use: true, flow: config.authentikInviteFlowId }),
+    });
+    if (!response.ok) {
+      console.error('Authentik invitation creation failed', response.status, await response.text());
+      return { status: 502, error: 'identity_provider_failed' };
+    }
+    invitation = await response.json();
+  }
+  const enrollmentUrl = new URL(`https://auth.${config.portalHost}/if/flow/supachat-invitation-enrollment/`);
+  enrollmentUrl.searchParams.set('itoken', invitation.pk);
+  enrollmentUrl.searchParams.set('next', next);
+  return { url: enrollmentUrl.toString(), expiresAt };
+}
+
+const parentControlsContext = {
+  json, body, sameOrigin, actor, webUser, deviceUser, QRCode,
+  base: requestBase, portalHost: config.portalHost,
+  deviceTokenHash: (userId) => config.deviceTokenHashes[userId] || '',
+  createInvitation: mintEnrollment,
+  afterJoin: ensureRoomMembershipMetadata,
+  pages: { manage: manageHtml, join: joinHtml },
+  installUrls: { android: config.androidInstallUrl, ios: config.iosInstallUrl },
+};
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
@@ -785,6 +830,8 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(appHtml);
     }
+
+    if (await handleParentControls(req, res, url, parentControlsContext)) return;
 
     const user = actor(req);
     if (!user) return json(res, 401, { error: 'unauthorized' });

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Join SupaChat</title>
+  <link rel="stylesheet" href="../app.css">
+  <style>.install-link{color:var(--green);font-weight:700}[hidden]{display:none!important}</style>
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <div class="brand-mark">S</div>
+    <h1>SupaChat</h1>
+    <p id="lede" class="lede">Checking your invite…</p>
+    <div id="install" hidden>
+      <p><a id="android" class="install-link" hidden>Get the Android app</a></p>
+      <p><a id="ios" class="install-link" hidden>Get the iPhone app</a></p>
+      <p id="after-install" class="lede">After installing, come back to this page, or scan the code again.</p>
+    </div>
+    <form id="enroll" hidden>
+      <label>Your username <input id="username" autocomplete="username" maxlength="32" required></label>
+      <p id="username-help" class="lede">We picked this for you. You can change it once, now.</p>
+      <button type="submit">Set my password</button>
+    </form>
+    <p id="have-account" hidden><button id="accept" type="button">I already have a SupaChat account</button></p>
+    <p id="error" class="error" aria-live="polite"></p>
+  </main>
+  <script src="../join.js"></script>
+</body>
+</html>

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SupaChat Parents</title>
+  <link rel="stylesheet" href="app.css">
+  <link rel="stylesheet" href="manage.css">
+</head>
+<body>
+  <div class="manage-shell">
+    <header class="manage-head">
+      <div><p class="eyebrow">SUPACHAT / PARENTS</p><h1>Your kids’ devices</h1>
+      <p class="muted">Clock, alarms, reminders, timers and screen time always work. Choose when the rest goes quiet.</p></div>
+      <a class="quiet-link" href="./">Back to chat</a>
+    </header>
+    <p id="state" class="muted" aria-live="polite">Loading…</p>
+    <main id="kids"></main>
+    <section id="invites-panel" class="card" hidden>
+      <h2>Pending invites</h2>
+      <ul id="invites"></ul>
+    </section>
+  </div>
+  <template id="kid-template">
+    <section class="card kid">
+      <header class="kid-head"><h2 class="kid-name"></h2><span class="kid-via muted"></span></header>
+      <p class="kid-parents muted"></p>
+      <div class="policy" hidden>
+        <h3>Quiet times</h3>
+        <div class="windows"></div>
+        <button type="button" class="add-window quiet-button">Add a quiet time</button>
+        <h3>Parent code</h3>
+        <label class="check"><input type="checkbox" class="clock-override"> Let the parent code change the device clock</label>
+        <label class="check"><input type="checkbox" class="device-settings"> Let the parent code open parent mode on the device</label>
+        <label class="row">New parent code <input class="parent-code" inputmode="numeric" pattern="\d{6,8}" maxlength="8" placeholder="6–8 digits" autocomplete="off"></label>
+        <p class="code-state muted"></p>
+        <div class="actions"><button type="button" class="save primary">Save</button><span class="save-state muted" aria-live="polite"></span></div>
+      </div>
+      <details class="invite">
+        <summary>Invite someone for this kid</summary>
+        <form class="invite-form">
+          <label class="row">Their name <input name="name" required maxlength="80" placeholder="Marie Dupont"></label>
+          <label class="row">They are
+            <select name="kind"><option value="parent">another parent of this kid</option><option value="kid">a friend (kid)</option></select></label>
+          <button class="primary" type="submit">Make invite</button>
+        </form>
+        <div class="invite-result" hidden><img class="invite-qr" alt="Invite QR code" width="220" height="220">
+          <p>Username ready: <b class="invite-username"></b> (they can change it once)</p>
+          <p><a class="invite-link" target="_blank" rel="noopener"></a></p>
+          <p class="muted">Scan with a phone, or open the link on a computer. One person, expires in 14 days.</p></div>
+      </details>
+    </section>
+  </template>
+  <script src="manage.js"></script>
+</body>
+</html>
