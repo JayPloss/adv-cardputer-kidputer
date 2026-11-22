@@ -74,17 +74,17 @@ def main():
     # getLyricsBySongId, and the Cardputers fetch them from there. A timed file from the timing pass
     # (lyrics/timed/) wins over LRCLIB's.
     print("[wolfpack-sync] lyrics beside the songs", flush=True)
-    for source in sorted((DATA / "lyrics").glob("*.lrc")) + sorted((DATA / "lyrics").glob("*.txt")):
-        timed = DATA / "lyrics" / "timed" / f"{source.stem}.lrc"
-        song = MUSIC / f"{source.stem}.mp3"
-        if not song.exists():
+    lyrics = DATA / "lyrics"
+    for stem in sorted({p.stem for p in lyrics.glob("*.lrc")} | {p.stem for p in lyrics.glob("*.txt")}):
+        if not (MUSIC / f"{stem}.mp3").exists():
             continue
-        if source.suffix == ".txt" and ((DATA / "lyrics" / f"{source.stem}.lrc").exists() or timed.exists()):
-            continue
-        chosen = timed if timed.exists() else source
-        target = MUSIC / f"{source.stem}{chosen.suffix}"
+        # Best first: the timed file from the timing pass, LRCLIB's line times, the plain words.
+        chosen = next(p for p in (lyrics / "timed" / f"{stem}.lrc", lyrics / f"{stem}.lrc", lyrics / f"{stem}.txt") if p.exists())
+        target = MUSIC / f"{stem}{chosen.suffix}"
         if not target.exists() or target.read_bytes() != chosen.read_bytes():
             target.write_bytes(chosen.read_bytes())
+        if chosen.suffix == ".lrc" and (MUSIC / f"{stem}.txt").exists():
+            (MUSIC / f"{stem}.txt").unlink()  # the timed .lrc replaces the plain words beside the song
     if fingerprint() == before and "--force" not in sys.argv:
         print("[wolfpack-sync] nothing changed on Spotify")
     else:
