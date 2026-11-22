@@ -1,5 +1,13 @@
 # Kids' music: Spotify playlists to Navidrome and SD cards
 
+**Automatic since 2026-11-21:** `wolfpack-sync.py` runs steps 1 to 4 plus the lyrics on its own: it fetches
+each playlist's Spotify page again, matches and rips only the new songs (a weak match waits in
+`<data>/needs-a-look.txt` for a `FIX` entry in `rip.py`), copies them to ori-san, rescans Navidrome and makes
+each kid's playlist again in Spotify's order; the Cardputers then fetch what they lack on home Wi-Fi.
+A systemd user timer runs it every 6 hours: `wolfpack-sync.service` and `.timer` here, linked into
+`~/.config/systemd/user`. `journalctl --user -u wolfpack-sync` shows each run. Songs removed on Spotify leave
+the Navidrome playlist; the cards keep their copy (the firmware deletes nothing).
+
 Run on paqman. Data (Spotify pages, matches, file map) lives in `~/.local/share/cardputer-music`
 (`$CARDPUTER_MUSIC_DATA`), the MP3s in `~/Music/wolfpack`. Neither is in this repo.
 

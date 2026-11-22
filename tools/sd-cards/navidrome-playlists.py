@@ -1,7 +1,7 @@
 """navidrome-playlists.py [scan|status]: make each kid's Navidrome playlist (Spotify order) from the Wolfpack album, logged in as that kid."""
 import os, sys, json, subprocess, hashlib, secrets, urllib.request, urllib.parse
 from pathlib import Path
-sp = Path(os.environ.get("CARDPUTER_MUSIC_DATA", Path.home() / ".local/share/cardputer-music")); HOST = "http://192.168.0.235:4533"
+sp = Path(os.environ.get("CARDPUTER_MUSIC_DATA", Path.home() / ".local/share/cardputer-music")); HOST = os.environ.get("NAVIDROME_URL", "http://192.168.0.235:4533")
 pl = json.loads((sp / "playlists.json").read_text()); files = json.loads((sp / "files.json").read_text())
 def call(user, ep, params):
     pw = subprocess.run(["secret-tool", "lookup", "service", "navidrome", "account", user], capture_output=True, text=True).stdout.strip()
@@ -20,9 +20,13 @@ for kid, keys in pl["lists"].items():
     albums = call(user, "search3", [("query", "Wolfpack"), ("songCount", "0"), ("artistCount", "0"), ("albumCount", "50")]).get("searchResult3", {}).get("album", [])
     found = [t for a in albums if a["name"] == "Wolfpack" for t in call(user, "getAlbum", [("id", a["id"])])["album"].get("song", [])]
     def pick(k):
-        want = pl["songs"][k]; first = want["artists"].split(", ")[0].lower()
-        hits = [t["id"] for t in found if t["title"] == want["title"] and first in (t.get("artist") or "").lower()]
-        return hits[0] if len(hits) == 1 else None
+        # By title; the artist only tells apart two songs of the same title. Spotify's credits change
+        # (2026-11-21: the KPop Demon Hunters songs' artists), the files keep the ones from their rip.
+        want = pl["songs"][k]; first = want["artists"].replace("\xa0", " ").split(", ")[0].split(",")[0].lower()
+        titled = [t for t in found if t["title"] == want["title"]]
+        if len(titled) > 1:
+            titled = [t for t in titled if first in (t.get("artist") or "").replace("\xa0", " ").lower()]
+        return titled[0]["id"] if len(titled) == 1 else None
     ids = [pick(k) for k in keys]
     missing = [files.get(k) or k for k, i in zip(keys, ids) if not i]
     for p in call(user, "getPlaylists", []).get("playlists", {}).get("playlist", []):

@@ -1,4 +1,8 @@
-"""resolve.py: Spotify playlist embed pages (DATA/spotify/*.html) -> DATA/playlists.json, plus one YouTube Music match per song (DATA/matches.json)."""
+"""resolve.py: Spotify playlist embed pages (DATA/spotify/*.html) -> DATA/playlists.json, plus one YouTube Music match per song (DATA/matches.json).
+
+Songs added by hand (keys not starting spotify:, such as Jay's Suno songs) stay at the end of their
+list. Only songs without a match yet are looked up, so a rerun after a playlist change is quick.
+"""
 import os, sys, re, json, unicodedata, difflib
 from pathlib import Path
 from ytmusicapi import YTMusic
@@ -8,6 +12,7 @@ sp = DATA
 def norm(s):
     s = unicodedata.normalize("NFKD", s.lower()); s = "".join(c for c in s if not unicodedata.combining(c))
     return re.sub(r"[^a-z0-9а-я ]+", " ", s).split()
+old = json.loads((sp / "playlists.json").read_text()) if (sp / "playlists.json").exists() else {"lists": {}, "songs": {}}
 lists, songs = {}, {}
 for f in sorted((sp / "spotify").glob("*.html")):
     d = json.loads(re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', f.read_text(), re.S).group(1))
@@ -16,11 +21,14 @@ for f in sorted((sp / "spotify").glob("*.html")):
     for t in e["trackList"]:
         k = t["uri"]; keys.append(k)
         songs[k] = {"artists": t["subtitle"], "title": t["title"], "ms": t["duration"], "explicit": t["isExplicit"]}
-    lists[e["name"]] = keys
+    extra = [k for k in old["lists"].get(e["name"], []) if not k.startswith("spotify:")]
+    for k in extra: songs[k] = old["songs"][k]
+    lists[e["name"]] = keys + extra
 (sp / "playlists.json").write_text(json.dumps({"lists": lists, "songs": songs}, ensure_ascii=False, indent=1))
 yt = YTMusic()
-out = {}
+out = json.loads((sp / "matches.json").read_text()) if (sp / "matches.json").exists() else {}
 for k, s in songs.items():
+    if k in out or not k.startswith("spotify:"): continue
     want = s["ms"] / 1000; tw = set(norm(s["title"])); aw = set(norm(s["artists"]))
     best = None
     for r in yt.search(f'{s["artists"].split(",")[0]} {s["title"]}', filter="songs", limit=10)[:8]:

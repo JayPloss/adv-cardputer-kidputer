@@ -1,4 +1,9 @@
-"""rip.py: rip every matched song with yt2phone.fetch into ~/Music/wolfpack/<Artist - Title>.mp3, tagged from Spotify (album Wolfpack). FIX overrides wrong matches by title."""
+"""rip.py: rip every matched song with yt2phone.fetch into ~/Music/wolfpack/<Artist - Title>.mp3, tagged from Spotify (album Wolfpack). FIX overrides wrong matches by title.
+
+A match scoring under WEAK (title, artist, length and explicit flag; most score above 3) isn't ripped
+on its own: it's listed in DATA/needs-a-look.txt until a FIX entry names the right video. Files added by
+hand (Suno songs) stay in files.json.
+"""
 import sys, json, re, os
 from pathlib import Path
 sys.path.insert(0, os.path.expanduser("~/Work/jay-ai-arsenal/tools"))
@@ -8,15 +13,21 @@ from mutagen.id3 import ID3, TIT2, TPE1, TALB, TIT1, TXXX
 sp = Path(os.environ.get("CARDPUTER_MUSIC_DATA", Path.home() / ".local/share/cardputer-music"))
 out = Path.home() / "Music" / "wolfpack"; out.mkdir(parents=True, exist_ok=True)
 FIX = {"Mauvais Garçon": "EM66I-uVseQ", "Tous les cris les S.O.S.": "dq-032PmXU4", "Ce soir - j'suis dans ma tête": "HZKEUbNNTzI"}
+WEAK = 2.0
 m = json.loads((sp / "matches.json").read_text())
+look = []
 prog = sp / "progress.txt"; log = open(sp / "rip.log", "a")
 safe = lambda s: re.sub(r'[\\/:*?"<>|]', "_", s).strip(". ")
-done = {}
+done = json.loads((sp / "files.json").read_text()) if (sp / "files.json").exists() else {}
 for i, (k, s) in enumerate(m.items(), 1):
+    if not s.get("match") and s["title"] not in FIX: look.append(f'no match: {s["artists"]} - {s["title"]}'); continue
     vid = FIX.get(s["title"]) or s["match"]["videoId"]
     name = f'{safe(s["artists"].split(",")[0])} - {safe(s["title"])}.mp3'
     dst = out / name
     prog.write_text(f"Wolfpack songs, {len(m) - i + 1} to go\n")
+    if not dst.exists() and s["title"] not in FIX and s["match"]["score"] < WEAK:
+        look.append(f'weak match ({s["match"]["score"]}): {s["artists"]} - {s["title"]} => {s["match"]["yt_artists"]} - {s["match"]["yt_title"]} https://music.youtube.com/watch?v={vid}')
+        continue
     if not dst.exists():
         tmp = out / ".tmp"; tmp.mkdir(exist_ok=True)
         got = fetch([f"https://music.youtube.com/watch?v={vid}"], tmp, log=log)
@@ -30,4 +41,5 @@ for i, (k, s) in enumerate(m.items(), 1):
         t.add(TXXX(encoding=3, desc="spotify_uri", text=k)); t.save(dst, v2_version=3)
     done[k] = name
 (sp / "files.json").write_text(json.dumps(done, ensure_ascii=False, indent=1))
+(sp / "needs-a-look.txt").write_text("".join(f"{line}\n" for line in look))
 prog.write_text("")

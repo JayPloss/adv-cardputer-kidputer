@@ -1,0 +1,11 @@
+# Every 6 hours, and 10 minutes after paqman starts; a run missed while it was off happens on wake.
+[Unit]
+Description=Wolfpack playlists every 6 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
