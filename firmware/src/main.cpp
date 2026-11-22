@@ -17,6 +17,8 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_sntp.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 #include <mbedtls/gcm.h>
 #include <algorithm>
 #include <array>
@@ -354,6 +356,8 @@ bool messageNotificationActive = false;
 volatile bool manualWifiMode = false;
 volatile bool radioOffWanted = false;
 volatile bool radioIsOff = false;
+// Sleep wants the radio off, whatever the players want: kept apart from radioOffWanted, which they set and clear.
+volatile bool sleepRadioOff = false;
 uint32_t lastCardMediaAt = 0;
 constexpr uint32_t kRadioOffWaitMs = 4000;
 constexpr uint8_t kListeningToneVolume = 36;
@@ -2254,7 +2258,7 @@ void networkTask(void *) {
       xSemaphoreGive(stateMutex);
     }
     if (chargingModeActive) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
-    if (radioOffWanted) {
+    if (radioOffWanted || sleepRadioOff) {
       if (!radioIsOff) {
         if (espNowActive) { esp_now_deinit(); espNowActive = false; }
         WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF);
@@ -3355,6 +3359,82 @@ void setIdleClock(bool shown) {
   if (shown) brightnessBeforeIdle = M5Cardputer.Display.getBrightness();
   else M5Cardputer.Display.setBrightness(brightnessBeforeIdle);
   Serial.printf("IDLE clock %s\n", shown ? "shown" : "hidden");
+}
+
+// ---- Sleep ----
+// Left open on the idle clock, a Cardputer ran from full to empty overnight (Jay, 2026-11-22): the clock kept
+// Wi-Fi connected, the CPU at full speed and the backlight on. After a while on the idle clock it sleeps for
+// real: screen and backlight off, radio off, the chip in light sleep. Any key (the keyboard chip's interrupt
+// line, GPIO11) or the rear button (GPIO0) wakes it, and that key does nothing else; a timer wakes it every
+// 30 s (or at a running timer's end) so alarms, the timer and screen time still ring on time. Messages are
+// fetched when it wakes. It never sleeps while something plays, rings, records, charges or syncs.
+constexpr uint32_t kSleepAfterMs = 10 * 60000u;   // without a key; the idle clock comes at 2 minutes
+constexpr uint32_t kSleepWakeEveryMs = 30000u;
+constexpr gpio_num_t kKeyboardInterruptPin = GPIO_NUM_11;
+constexpr gpio_num_t kRearButtonPin = GPIO_NUM_0;
+bool sleeping = false;
+
+bool sleepAllowed() {
+  return idleClockShown && idleClockAllowed() && !media::active() && !mediaStarting && !mediaTasksWanted &&
+         !chargingModeActive && !library::cardSyncRunning() && !walkieConnected && alarmSong == AlarmSong::None &&
+         !messageNotificationActive && !messageNotificationPending && !audioPlaying;
+}
+
+void enterSleep() {
+  sleeping = true;
+  Serial.println("SLEEP entered");
+  sleepRadioOff = true;
+  for (const uint32_t started = millis(); !radioIsOff && millis() - started < 5000;) delay(20);
+  M5Cardputer.Speaker.end();
+  M5Cardputer.Display.setBrightness(0);
+  M5Cardputer.Display.sleep();
+}
+
+void leaveSleep(const char *why) {
+  sleeping = false;
+  M5Cardputer.Display.wakeup();
+  setIdleClock(false);  // gives the backlight back
+  M5Cardputer.Speaker.begin(); M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  sleepRadioOff = false; syncOverride = true;
+  lastUserInputAt = millis(); inputQuarantined = true;  // the waking key does nothing else
+  renderDirty = true;
+  Serial.printf("SLEEP left: %s\n", why);
+}
+
+// One light sleep: until a key, the rear button, the next 30 s or a running timer's end. True if a key or the
+// button woke it.
+bool sleepOnce() {
+  uint32_t forMs = kSleepWakeEveryMs;
+  const uint32_t now = millis();
+  for (const clockapps::Countdown *countdown : {&timerCountdown, &screenTime.countdown})
+    if (countdown->state == clockapps::Countdown::State::Running) forMs = std::min(forMs, std::max<uint32_t>(countdown->leftMs(now), 1));
+  esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(forMs) * 1000);
+  gpio_wakeup_enable(kKeyboardInterruptPin, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable(kRearButtonPin, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_light_sleep_start();
+  const bool byKey = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO;
+  gpio_wakeup_disable(kKeyboardInterruptPin);
+  gpio_wakeup_disable(kRearButtonPin);
+  // The keyboard reader's interrupt on GPIO11 is on both edges; the wake setting replaced that with low level.
+  gpio_set_intr_type(kKeyboardInterruptPin, GPIO_INTR_ANYEDGE);
+  return byKey;
+}
+
+void serviceClockApps();
+
+// Called first in each loop: true while asleep (the loop does nothing else then).
+bool serviceSleep() {
+  if (!sleeping) {
+    if (sleepAllowed() && millis() - lastUserInputAt >= kSleepAfterMs) enterSleep();
+    return sleeping;
+  }
+  const bool byKey = sleepOnce();
+  M5Cardputer.update();
+  if (byKey || M5Cardputer.Keyboard.isPressed() || M5Cardputer.BtnA.isPressed()) { leaveSleep("key"); return false; }
+  serviceClockApps();
+  if (ringingNow() != Ringing::None) { leaveSleep("ringing"); return false; }
+  return true;
 }
 
 void serviceIdleClock() {
@@ -4901,6 +4981,7 @@ void loop() {
 }
 
 static void loopBody() {
+  if (serviceSleep()) return;
   M5Cardputer.update();
   if (M5Cardputer.BtnA.isPressed()) lastUserInputAt = millis();
   sampleBattery(); handleKeyboard(); serviceFoxFinding(); serviceClockApps();
