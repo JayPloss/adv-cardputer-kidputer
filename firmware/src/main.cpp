@@ -72,7 +72,7 @@ const char *failureText(const char *english) {
   if (frenchUi) for (const auto &pair : kFrench) if (!strcmp(english, pair[0])) return pair[1];
   return english;
 }
-constexpr char kFirmwareVersion[] = "v0.60";
+constexpr char kFirmwareVersion[] = "v0.61";
 constexpr size_t kMessageLimit = 140;
 constexpr size_t kHistoryLimit = 100;  // What the first sync fetches; older pages go to the card.
 constexpr size_t kRamMessageLimit = 40;
@@ -89,7 +89,10 @@ constexpr uint32_t kMediaSyncPollMs = 60000;
 constexpr uint32_t kBookmarkEveryMs = 30000;
 constexpr uint32_t kBookSkipSeconds = 30;
 constexpr uint32_t kBatterySampleMs = 1000;
-constexpr uint32_t kBatteryRiseStepMs = 180000;
+// The shown level climbs at most 1% a minute (60% an hour), above any real charge, so it keeps up
+// with a charging cell. At 1% per 3 minutes it showed 25% to 45% for an hour that took the cell
+// from 25% to 65%, in charging mode as in normal use (emulator scenarios charge-normal, charge-charging).
+constexpr uint32_t kBatteryRiseStepMs = 60000;
 constexpr uint32_t kBatteryFastRiseStepMs = 10000;
 constexpr uint32_t kPowerIdleAfterInputMs = 5000;
 constexpr size_t kPowerTrendSamples = 6;
@@ -1735,6 +1738,7 @@ void addChargePlotPoint(bool logSample = true) {
 
 void enterChargingMode() {
   stopMediaNow();
+  library::stopCardSync(3000);
   if (chargingModeActive) return;
   chargingModeActive = true;
   inputQuarantined = true;
@@ -2400,6 +2404,8 @@ void drawWarningBanner() {
 size_t utf8CharacterCount(const String &text);
 String utf8Tail(const String &text, size_t maximumCharacters);
 void printFont0Text(const String &text);
+void printChatText(const String &text);
+void drawEmoji(int kind, int x, int y, uint32_t background);
 
 // Ticks drawn with lines, not a font: Font0 has no check mark that reads at this size.
 void drawMessageMark(int8_t mark, int y) {
@@ -2497,7 +2503,7 @@ void drawChat() {
       display.setTextColor(lines[index].colour, lineBackground); printFont0Text(lines[index].sender);
       display.setTextColor(TFT_WHITE, lineBackground); display.print(": ");
     } else display.setTextColor(TFT_WHITE, lineBackground);
-    printFont0Text(lines[index].text);
+    printChatText(lines[index].text);
     drawMessageMark(lines[index].mark, y);
     y += 17;
   }
@@ -2536,7 +2542,7 @@ constexpr int kEmojiRecipeCount = sizeof(kEmojiRecipes) / sizeof(kEmojiRecipes[0
 void drawEmojiRecipes() {
   auto &display=uiCanvas; display.fillScreen(TFT_BLACK); drawHeader(uiText("EMOJI", "EMOJIS")); display.setTextSize(1);
   const int start=std::max(0,emojiRecipeSelection-5);
-  for(int i=start;i<kEmojiRecipeCount && i<start+6;i++){const int y=22+(i-start)*15; const bool selected=i==emojiRecipeSelection; display.fillRoundRect(8,y,224,13,3,selected?TFT_DARKGREEN:TFT_BLACK); display.setTextColor(selected?TFT_YELLOW:TFT_WHITE,selected?TFT_DARKGREEN:TFT_BLACK); display.setCursor(14,y+3); display.print(kEmojiRecipes[i]);}
+  for(int i=start;i<kEmojiRecipeCount && i<start+6;i++){const int y=22+(i-start)*15; const bool selected=i==emojiRecipeSelection; display.fillRoundRect(8,y,224,13,3,selected?TFT_DARKGREEN:TFT_BLACK); display.setTextColor(selected?TFT_YELLOW:TFT_WHITE,selected?TFT_DARKGREEN:TFT_BLACK); display.setCursor(14,y+3); display.print(kEmojiRecipes[i]); drawEmoji(i, 200, y, selected?TFT_DARKGREEN:TFT_BLACK);}
   display.setTextColor(TFT_DARKGREY,TFT_BLACK); display.setCursor(7,121); display.print(uiText("UP/DOWN BROWSE  ENTER BACK","HAUT/BAS VOIR  ENTER RETOUR"));
 }
 
@@ -2627,6 +2633,7 @@ void drawStatus() {
     if (WiFi.status() == WL_CONNECTED) line("WI-FI  " + utf8Head(currentSsid.get(), 18) + " " + String(wifiRssi) + " dBm");
     else line(String("WI-FI  ") + (status == "ESPNOW ONLY" ? uiText("no saved network here", "aucun reseau connu ici")
                                   : status == "JOIN FAILED" ? uiText("join failed (password?)", "echec (mot de passe?)") : status.c_str()));
+    { char sync[40]; library::cardSyncText(sync, sizeof sync); line(String(uiText("MUSIC  ", "MUSIQUE  ")) + sync); }
     const String detail = serverStageDetail.get();
     if (serverStage == ServerStage::Auth || serverStage == ServerStage::Http) line(String("HTTP ") + serverStageStatus + "  " + detail);
     else if (detail.length()) line(detail);
@@ -2804,6 +2811,7 @@ bool adjacentWanted = false;
 bool mediaTasksWanted = false;
 bool queueEnded = false;
 uint32_t homeNoticeAt = 0;
+bool homeNoticeGood = false;  // Good news (new songs) in green; faults and refusals stay red.
 
 String utf8Head(const String &text, size_t maximumCharacters) {
   size_t characters = 0;
@@ -2848,7 +2856,7 @@ void drawHome() {
   for (int dot = 0; dot < kHomePageCount; dot++) display.fillCircle(120 + (dot * 2 - kHomePageCount + 1) * 7, 105, 3, dot == page ? TFT_GREEN : TFT_DARKGREY);
   display.setTextSize(1);
   const auto *playing = nowPlayingItem();
-  if (homeNotice.length()) { display.setTextColor(TFT_RED, TFT_BLACK); display.setCursor(6, 112); display.print(homeNotice.substring(0, 38)); }
+  if (homeNotice.length()) { display.setTextColor(homeNoticeGood ? TFT_GREEN : TFT_RED, TFT_BLACK); display.setCursor(6, 112); display.print(homeNotice.substring(0, 38)); }
   else if (clockLine().length()) { display.setTextColor(TFT_CYAN, TFT_BLACK); display.setCursor(6, 112); display.print(clockLine()); }
   else if (playing && media::active()) { display.setTextColor(TFT_YELLOW, TFT_BLACK); display.setCursor(6, 112); printFont0Text(utf8Head(playing->title, 37)); }
   display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 123); display.print(uiText("ARROWS MOVE       ENTER OPEN", "FLECHES           ENTER OUVRIR"));
@@ -3692,6 +3700,68 @@ void printFont0Text(const String &text) {
   uiCanvas.setAttribute(lgfx::attribute::UTF8_SWITCH, true);
 }
 
+// Emoji recipes, drawn as small pictures in chat: Font0 has no emoji, and these read at 12 px.
+// A recipe counts only standing alone (start, space or punctuation either side), so "http://x" stays text.
+// Each takes the place of its two letters, so lines wrap and highlight as they did.
+const char *const kEmojiCodes[] = {":)", ":(", ";)", ":D", "<3", ":P", ":O", ":/"};
+constexpr int kEmojiCodeCount = sizeof(kEmojiCodes) / sizeof(kEmojiCodes[0]);
+
+int emojiAt(const String &text, int at) {
+  if (at + 1 >= static_cast<int>(text.length())) return -1;
+  auto boundary = [](char c) { return c == ' ' || c == '.' || c == ',' || c == '!' || c == '?'; };
+  if (at > 0 && !boundary(text[at - 1])) return -1;
+  if (at + 2 < static_cast<int>(text.length()) && !boundary(text[at + 2])) return -1;
+  for (int kind = 0; kind < kEmojiCodeCount; kind++)
+    if (text[at] == kEmojiCodes[kind][0] && (text[at + 1] == kEmojiCodes[kind][1] || (kEmojiCodes[kind][1] == 'D' && text[at + 1] == 'd') ||
+        (kEmojiCodes[kind][1] == 'P' && text[at + 1] == 'p') || (kEmojiCodes[kind][1] == 'O' && text[at + 1] == 'o'))) return kind;
+  return -1;
+}
+
+void drawEmoji(int kind, int x, int y, uint32_t background) {
+  auto &display = uiCanvas;
+  const int cx = x + 8, cy = y + 5;
+  if (kind == 4) {  // <3: a red heart.
+    display.fillCircle(cx - 3, cy - 1, 3, TFT_RED); display.fillCircle(cx + 3, cy - 1, 3, TFT_RED);
+    display.fillTriangle(cx - 6, cy, cx + 6, cy, cx, cy + 6, TFT_RED);
+    return;
+  }
+  display.fillCircle(cx, cy, 6, TFT_YELLOW);
+  const uint16_t ink = TFT_BLACK;
+  // Eyes; a wink closes the right one.
+  display.fillRect(cx - 3, cy - 3, 2, 2, ink);
+  if (kind == 2) display.drawFastHLine(cx + 1, cy - 2, 3, ink); else display.fillRect(cx + 2, cy - 3, 2, 2, ink);
+  switch (kind) {
+    case 0: case 2: case 5:  // :)  ;)  :P
+      display.drawPixel(cx - 3, cy + 1, ink); display.drawFastHLine(cx - 2, cy + 2, 5, ink); display.drawPixel(cx + 3, cy + 1, ink);
+      if (kind == 5) display.fillRect(cx, cy + 3, 2, 2, TFT_RED);
+      break;
+    case 1:  // :(
+      display.drawPixel(cx - 3, cy + 3, ink); display.drawFastHLine(cx - 2, cy + 2, 5, ink); display.drawPixel(cx + 3, cy + 3, ink); break;
+    case 3:  // :D
+      display.fillRect(cx - 3, cy + 1, 7, 2, ink); display.fillRect(cx - 2, cy + 3, 5, 1, ink); break;
+    case 6:  // :O
+      display.drawRect(cx - 1, cy + 1, 3, 3, ink); break;
+    case 7:  // :/
+      display.drawLine(cx - 3, cy + 3, cx + 3, cy + 1, ink); break;
+  }
+}
+
+// A chat line: text through Font0, recipes as pictures in their two letters' space.
+void printChatText(const String &text) {
+  int start = 0;
+  for (int at = 0; at < static_cast<int>(text.length()); at++) {
+    const int kind = emojiAt(text, at);
+    if (kind < 0) continue;
+    if (at > start) printFont0Text(text.substring(start, at));
+    const int x = uiCanvas.getCursorX(), y = uiCanvas.getCursorY();
+    const int advance = uiCanvas.textWidth("  ");
+    drawEmoji(kind, x + (advance - 17) / 2, y, uiCanvas.getTextStyle().back_rgb888);
+    uiCanvas.setCursor(x + advance, y);
+    start = at + 2; at++;
+  }
+  if (start < static_cast<int>(text.length())) printFont0Text(text.substring(start));
+}
+
 bool appendKeyboardText(String &target, const char *text, size_t limit, bool byteLimit) {
   const size_t added = strlen(text);
   if (byteLimit ? target.length() + added > limit : utf8CharacterCount(target) + 1 > limit) return false;
@@ -3987,7 +4057,7 @@ void startQueuedTrack(uint32_t offsetSeconds) {
 
 // A media app asks for its tasks; they start once any secure connection in flight has
 // finished, and until then its first request waits in the queue with LOADING on the screen.
-void startMediaTasks() { mediaTasksWanted = true; os::holdSecure(true); }
+void startMediaTasks() { mediaTasksWanted = true; os::holdSecure(true); library::stopCardSync(0); }
 
 // The alarm's song is chosen from the card's music only: it has to play with no network.
 void openAlarmSoundPicker() {
@@ -4115,7 +4185,7 @@ void openHomeApp(int index) {
   else if (app == AppId::Stopwatch) screenMode = ScreenMode::Stopwatch;
   else if (app == AppId::Wifi) {
     // Wi-Fi is off while local mode is on, and joining a network would have nowhere to go.
-    if (localOnlyMode) { homeNotice = uiText("TURN LOCAL OFF FIRST", "COUPER LOCAL D'ABORD"); homeNoticeAt = millis(); bumpHome(0); return; }
+    if (localOnlyMode) { homeNotice = uiText("TURN LOCAL OFF FIRST", "COUPER LOCAL D'ABORD"); homeNoticeAt = millis(); homeNoticeGood = false; bumpHome(0); return; }
     screenMode = ScreenMode::Networks; scanForNetworks();
   }
   else if (app == AppId::Volume) screenMode = ScreenMode::Volume;
@@ -4241,6 +4311,39 @@ os::Owner frontApp() {
   }
 }
 
+// Card sync: the owner's playlist onto the card, whenever it sits on Wi-Fi with no media app open and
+// nothing playing. A pass a minute after boot, then every 30 minutes (10 after one that failed).
+constexpr uint32_t kCardSyncFirstMs = 60000;
+constexpr uint32_t kCardSyncEveryMs = 30 * 60000;
+constexpr uint32_t kCardSyncRetryMs = 10 * 60000;
+constexpr uint32_t kCardSyncMoreMs = 2 * 60000;  // More songs to get, or the connection was busy.
+uint32_t nextCardSyncAt = kCardSyncFirstMs;
+bool cardSyncWasRunning = false;
+int cardSyncNews = 0;
+void serviceCardSync() {
+  const bool running = library::cardSyncRunning();
+  if (cardSyncWasRunning && !running) {
+    char text[40]; library::cardSyncText(text, sizeof text);
+    nextCardSyncAt = millis() + (strstr(text, "UP TO DATE") || strstr(text, "NO PLAYLIST") ? kCardSyncEveryMs
+                                 : strstr(text, "GETTING") || strstr(text, "BUSY") ? kCardSyncMoreMs : kCardSyncRetryMs);
+    cardSyncNews += library::takeCardSyncAdded();
+  }
+  // Said on HOME once someone is there to read it, not under the idle clock; passes add up.
+  if (cardSyncNews > 0 && screenMode == ScreenMode::Home && !idleClockShown && homeNotice.isEmpty()) {
+    homeNotice = String(cardSyncNews) + (cardSyncNews == 1 ? uiText(" NEW SONG ON THE CARD", " NOUVELLE CHANSON") : uiText(" NEW SONGS ON THE CARD", " NOUVELLES CHANSONS"));
+    homeNoticeAt = millis(); homeNoticeGood = true; renderDirty = true; cardSyncNews = 0;
+  }
+  cardSyncWasRunning = running;
+  const bool mediaBusy = frontApp() == os::mediaOwner() || media::active() || mediaStarting || mediaTasksWanted;
+  if (running && (mediaBusy || chargingModeActive)) { library::stopCardSync(0); return; }
+  if (running || mediaBusy || chargingModeActive || !sdReady || WiFi.status() != WL_CONNECTED || !library::configured()) return;
+  if (static_cast<int32_t>(millis() - nextCardSyncAt) < 0) return;
+  // Only when the connection broker has room: the pass's task and socket fit beside nothing else.
+  if (os::secureHeld() || !os::secureFits()) return;  // Room for its task too, not just its connection.
+  library::startCardSync();
+  cardSyncWasRunning = true;
+}
+
 void serviceApps() {
   const os::Owner front = frontApp();
   for (const os::Owner app : {os::Owner::Music, os::Owner::Books}) {
@@ -4255,13 +4358,14 @@ void serviceApps() {
   if (front != os::mediaOwner() && !media::active() && !mediaStarting) {
     media::end(); library::end(); mediaTasksWanted = false; os::holdSecure(false);
     os::reconcile(os::Owner::Music); os::reconcile(os::Owner::Books);
-  } else if (mediaTasksWanted && !os::secureHeld()) {
+  } else if (mediaTasksWanted && !os::secureHeld() && !library::cardSyncRunning()) {
     if (!library::begin() || !media::begin()) os::recordFault(os::mediaOwner(), "no RAM to start");
     mediaTasksWanted = false;
   }
+  serviceCardSync();
   char notice[64];
-  if (os::takeFaultNotice(notice, sizeof(notice))) { homeNotice = notice; homeNoticeAt = millis(); renderDirty = true; }
-  if (homeNotice.length() && millis() - homeNoticeAt > 10000) { homeNotice = ""; renderDirty = true; }
+  if (os::takeFaultNotice(notice, sizeof(notice))) { homeNotice = notice; homeNoticeAt = millis(); homeNoticeGood = false; renderDirty = true; }
+  if (homeNotice.length() && millis() - homeNoticeAt > 10000) { homeNotice = ""; homeNoticeGood = false; renderDirty = true; }
 }
 
 void serviceMedia() {

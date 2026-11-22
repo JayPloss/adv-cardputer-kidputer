@@ -208,6 +208,18 @@ bool acquireSecure(Priority priority, uint32_t waitMs) {
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
+bool plainFits() { return !secureHeldBack.load() && ESP.getFreeHeap() > kPlainAdmitFree && ESP.getMaxAllocHeap() > kPlainAdmitLargest; }
+bool acquirePlain(Priority priority, uint32_t waitMs) {
+  const uint32_t started = millis();
+  for (;;) {
+    if (xSemaphoreTake(secureMutex, 0) == pdTRUE) {
+      if (!secureBusy.load() && plainFits()) { secureBusy = true; xSemaphoreGive(secureMutex); return true; }
+      xSemaphoreGive(secureMutex);
+    }
+    if (priority == Priority::Background || millis() - started >= waitMs) return false;
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
 void releaseSecure() { secureBusy = false; }
 bool secureHeld() { return secureBusy.load(); }
 

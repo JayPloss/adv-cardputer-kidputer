@@ -3,6 +3,7 @@ export const homeApps = ['SUPACHAT','MUSIC','BOOKS','R/C','TIMER','ALARM','SCREE
 const clockScreens = ['timer','alarm','screen-time','stopwatch'];
 const settingsScreens = ['networks','password','volume','status','language','charging-confirm','changelog'];
 export const changelog = [
+  {version:'v0.61',lines:['Emoji show as pictures','New songs come over Wi-Fi','STATUS: music sync line','Battery % keeps up charging']},
   {version:'v0.60',lines:['Big clock after 2 min idle','Sleep timer: T in players','Books at bedtime: 30 min','Alarm can play a song','School nights: book off 21:30']},
   {version:'v0.59',lines:['Every book on the card shows','No crash listing at low RAM','MP3s with cover art play','VBR songs: right length','Says why a file won\'t play']},
   {version:'v0.58',lines:['Up to four alarms','Weekday and weekend switches','Fixed: a play could be lost','French keyboard: CSA layout','Tab in chat: French keys','Alarm time typed from 00:00','Hints name the real exit key']},

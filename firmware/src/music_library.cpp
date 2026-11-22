@@ -25,7 +25,12 @@
 
 namespace library {
 namespace {
+// The emulator points a build at the server through the tailnet with SUPACHAT_MUSIC_HOST_OVERRIDE.
+#ifdef SUPACHAT_MUSIC_HOST_OVERRIDE
+constexpr char kHost[] = SUPACHAT_MUSIC_HOST_OVERRIDE;
+#else
 constexpr char kHost[] = SUPACHAT_MUSIC_HOST;
+#endif
 constexpr char kUser[] = SUPACHAT_MUSIC_USER;
 constexpr char kPassword[] = SUPACHAT_MUSIC_PASSWORD;
 constexpr char kBooksFolderName[] = "Books";
@@ -123,6 +128,7 @@ bool fetch(const String &url, JsonDocument &filter, JsonDocument &document) {
   http.setTimeout(kTimeoutMs);
   http.begin(url);
   const int code = http.GET();
+  if (code != HTTP_CODE_OK) Serial.printf("library: server answered %d\n", code);
   if (code < 0) { serverDownAt = millis(); serverWasDown = true; }
   if (code != HTTP_CODE_OK) { failureText = code < 0 ? "NO SERVER" : "SERVER ERROR"; http.end(); return false; }
   serverWasDown = false;
@@ -499,6 +505,243 @@ void enqueue(Job job, bool loadsList) {
   xSemaphoreGive(mutex);
 }
 }  // namespace
+
+// ---- Card sync ----
+namespace {
+constexpr uint32_t kSyncReadMs = 15000;  // A download that stalls this long is dropped and tried next pass.
+constexpr uint64_t kSyncSpareBytes = 8ull * 1024 * 1024;  // Left free on the card.
+// A pass holds the one network connection the RAM allows, chat's included, so it takes a few songs
+// and gives chat its turn; the next pass comes two minutes later.
+constexpr int kSyncSongsPerPass = 4;
+TaskHandle_t syncHandle = nullptr;
+volatile bool syncStop = false;
+volatile int syncAdded = 0;
+volatile int syncTotal = -1, syncDone = 0, syncMissing = 0;
+const char *volatile syncState = "NOT RUN YET";
+
+// card.py's safe(): \/:*?"<>| become _, then dots and spaces come off both ends.
+void safeName(const char *in, String &out) {
+  out = "";
+  for (const char *c = in; *c; c++) out += strchr("\\/:*?\"<>|", *c) ? '_' : *c;
+  int start = 0, end = out.length();
+  while (start < end && (out[start] == '.' || out[start] == ' ')) start++;
+  while (end > start && (out[end - 1] == '.' || out[end - 1] == ' ')) end--;
+  out = out.substring(start, end);
+}
+
+bool onCard(const String &path) { return SD.exists(path); }
+
+// A song already on the card under another number (the playlist was reordered): its name after "NNN ".
+bool renameRenumbered(const String &folder, const String &name) {
+  DIR *dir = opendir((String(kCardMount) + folder).c_str());
+  if (!dir) return false;
+  const char *tail = name.c_str() + 4;
+  String found;
+  for (const dirent *entry; !syncStop && (entry = readdir(dir));) {
+    const char *other = entry->d_name;
+    if (strlen(other) > 4 && isdigit(other[0]) && isdigit(other[1]) && isdigit(other[2]) && other[3] == ' ' && !strcmp(other + 4, tail)) { found = other; break; }
+  }
+  closedir(dir);
+  return found.length() && SD.rename(folder + "/" + found, folder + "/" + name);
+}
+
+// Reads up to `marker` in the stream; false if it never came.
+bool skipTo(YieldingReader &reader, const char *marker) {
+  const size_t length = strlen(marker);
+  size_t matched = 0;
+  for (int c; (c = reader.read()) >= 0;) {
+    matched = c == marker[matched] ? matched + 1 : (c == marker[0] ? 1 : 0);
+    if (matched == length) return true;
+  }
+  return false;
+}
+
+// The playlist, one entry at a time from the socket into a list file on the card: 110 songs
+// of Navidrome's JSON don't fit in RAM, one does. Lines: id TAB name.
+int writeManifest(const String &playlistId, const String &folder, const String &manifest) {
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setConnectTimeout(kConnectTimeoutMs);
+  http.setTimeout(kTimeoutMs);
+  http.begin(apiUrl("getPlaylist") + "&id=" + urlEncode(playlistId));
+  if (http.GET() != HTTP_CODE_OK) { http.end(); syncState = "NO SERVER"; return -1; }
+  YieldingReader reader{http.getStream()};
+  File out = SD.open(manifest, FILE_WRITE);
+  if (!out) { http.end(); syncState = "CARD NOT WRITABLE"; return -1; }
+  int count = 0;
+  if (skipTo(reader, "\"entry\":[")) {
+    JsonDocument filter;
+    filter["id"] = true; filter["title"] = true; filter["artist"] = true; filter["suffix"] = true;
+    for (;;) {
+      int c;
+      do c = reader.read(); while (c == ',' || c == ' ' || c == '\n' || c == '\r');
+      if (c != '{' || syncStop) break;
+      // The parser wants the whole object: this one's brace was read, so it goes back in front.
+      struct Prefixed { YieldingReader &inner; bool sent; explicit Prefixed(YieldingReader &reader) : inner(reader), sent(false) {} int read() { if (!sent) { sent = true; return '{'; } return inner.read(); }
+        size_t readBytes(char *buffer, size_t length) { size_t n = 0; while (n < length) { const int v = read(); if (v < 0) break; buffer[n++] = v; } return n; } } prefixed(reader);
+      JsonDocument entry;
+      if (deserializeJson(entry, prefixed, DeserializationOption::Filter(filter))) break;
+      count++;
+      if (strcmp(entry["suffix"] | "", "mp3") != 0) continue;  // The player plays MP3s only.
+      String title, artist;
+      safeName(entry["title"] | "?", title);
+      String first = entry["artist"] | "?";
+      const int comma = first.indexOf(", ");
+      if (comma > 0) first = first.substring(0, comma);
+      safeName(first.c_str(), artist);
+      char number[8];
+      snprintf(number, sizeof number, "%03d ", count);
+      out.printf("%s\t%s%s - %s.mp3\n", entry["id"] | "", number, title.c_str(), artist.c_str());
+    }
+  }
+  out.close();
+  http.end();
+  return syncStop ? -1 : count;
+}
+
+// One song, into a hidden file first, renamed only once every byte is there.
+bool download(const String &id, const String &folder, const String &name) {
+  const String part = folder + "/.part.mp3";
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setConnectTimeout(kConnectTimeoutMs);
+  http.setTimeout(kTimeoutMs);
+  http.begin(apiUrl("download") + "&id=" + urlEncode(id));
+  if (http.GET() != HTTP_CODE_OK) { http.end(); syncState = "NO SERVER"; return false; }
+  const int length = http.getSize();
+  if (length > 0 && SD.totalBytes() - SD.usedBytes() < static_cast<uint64_t>(length) + kSyncSpareBytes) { http.end(); syncState = "CARD FULL"; return false; }
+  File out = SD.open(part, FILE_WRITE);
+  if (!out) { http.end(); syncState = "CARD NOT WRITABLE"; return false; }
+  WiFiClient &client = http.getStream();
+  uint8_t buffer[1536];  // On the task's stack: no RAM held between passes.
+  int written = 0;
+  uint32_t lastData = millis();
+  bool ok = true;
+  while (!syncStop && (length < 0 || written < length)) {
+    const int available = client.available();
+    if (available <= 0) {
+      if (!client.connected() && length < 0) break;
+      if (!client.connected() || millis() - lastData > kSyncReadMs) { ok = false; break; }
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+    const int got = client.read(buffer, std::min<int>(available, sizeof buffer));
+    if (got <= 0) continue;
+    if (out.write(buffer, got) != static_cast<size_t>(got)) { ok = false; syncState = "CARD FULL"; break; }
+    written += got; lastData = millis();
+  }
+  out.close();
+  http.end();
+  ok = ok && !syncStop && (length < 0 || written == length) && written > 0;
+  if (!ok) { SD.remove(part); return false; }
+  SD.remove(folder + "/" + name);
+  return SD.rename(part, folder + "/" + name);
+}
+
+void syncPass() {
+  syncDone = 0; syncMissing = 0;
+  if (!configured()) { syncState = "SERVER NOT SET UP"; return; }
+  if (WiFi.status() != WL_CONNECTED) { syncState = "NO WIFI"; return; }
+  if (!SD.exists("/")) { syncState = "NO CARD"; return; }
+  syncState = "LOOKING";
+  JsonDocument filter, document;
+  filter["subsonic-response"]["playlists"]["playlist"][0]["id"] = true;
+  filter["subsonic-response"]["playlists"]["playlist"][0]["name"] = true;
+  if (!fetch(apiUrl("getPlaylists"), filter, document)) { syncState = failureText; return; }
+  String playlistId, playlistName;
+  for (JsonObjectConst list : document["subsonic-response"]["playlists"]["playlist"].as<JsonArrayConst>()) {
+    const String name = list["name"] | "";
+    if (name.equalsIgnoreCase(kUser)) { playlistId = list["id"] | ""; playlistName = name; }
+  }
+  document.clear();
+  if (playlistId.isEmpty()) { syncState = "NO PLAYLIST"; return; }
+  String folder;
+  safeName(playlistName.c_str(), folder);
+  folder = "/music/" + folder;
+  if (!SD.exists("/music")) SD.mkdir("/music");
+  if (!SD.exists(folder)) SD.mkdir(folder);
+  const String manifest = folder + "/.sync.txt";
+  const int total = writeManifest(playlistId, folder, manifest);
+  if (total < 0) return;
+  syncTotal = total;
+  // Count what's missing first, so STATUS can say how many are left.
+  int missing = 0;
+  {
+    File list = SD.open(manifest, FILE_READ);
+    while (list && list.available() && !syncStop) {
+      String line = list.readStringUntil('\n');
+      const int tab = line.indexOf('\t');
+      if (tab > 0 && !onCard(folder + "/" + line.substring(tab + 1))) missing++;
+    }
+    if (list) list.close();
+  }
+  syncMissing = missing;
+  if (!missing) { syncState = "UP TO DATE"; return; }
+  syncState = "GETTING";
+  File list = SD.open(manifest, FILE_READ);
+  size_t offset = 0;
+  bool failed = false;
+  while (list && !syncStop && !failed) {
+    list.seek(offset);
+    if (!list.available()) break;
+    String line = list.readStringUntil('\n');
+    offset = list.position();
+    const int tab = line.indexOf('\t');
+    if (tab <= 0) continue;
+    const String id = line.substring(0, tab), name = line.substring(tab + 1);
+    if (onCard(folder + "/" + name)) continue;
+    if (syncDone >= kSyncSongsPerPass) { syncState = "MORE TO GET"; break; }
+    // The card file stays closed while a song downloads: two open files is RAM the player may want.
+    list.close();
+    if (renameRenumbered(folder, name)) { syncDone = syncDone + 1; }
+    else {
+      const bool got = download(id, folder, name);
+      if (got) { syncDone = syncDone + 1; syncAdded = syncAdded + 1; }
+      else failed = true;
+    }
+    list = SD.open(manifest, FILE_READ);
+  }
+  if (list) list.close();
+  if (syncStop) syncState = "PAUSED";
+  else if (!failed && strcmp(syncState, "MORE TO GET")) syncState = "UP TO DATE";
+}
+
+void syncTask(void *) {
+  os::bindTask(os::Owner::Music);
+  // The whole pass holds the connection broker: started only when it has room (main loop checks),
+  // so a socket here never meets a TLS handshake's RAM, and chat waits out one short pass.
+  try {
+    os::PlainLease lease(os::Priority::Background);
+    if (lease.held) syncPass(); else syncState = "BUSY";
+  } catch (const std::bad_alloc &) { syncState = "OUT OF MEMORY"; os::recordFault(os::Owner::Music, "card sync out of memory"); }
+  syncHandle = nullptr;
+  vTaskDelete(nullptr);
+}
+}  // namespace
+
+void startCardSync() {
+  if (syncHandle) return;
+  syncStop = false;
+  xTaskCreatePinnedToCore(syncTask, "cardsync", 8192, nullptr, 1, &syncHandle, 0);
+}
+
+void stopCardSync(uint32_t waitMs) {
+  if (!syncHandle) return;
+  syncStop = true;
+  const uint32_t started = millis();
+  while (syncHandle && millis() - started < waitMs) vTaskDelay(pdMS_TO_TICKS(20));
+}
+
+bool cardSyncRunning() { return syncHandle != nullptr; }
+
+void cardSyncText(char *text, size_t size) {
+  const char *state = syncState;
+  if (!strcmp(state, "GETTING") || !strcmp(state, "MORE TO GET")) snprintf(text, size, "GETTING %d OF %d", syncDone + 1, syncMissing);
+  else if (!strcmp(state, "UP TO DATE") && syncTotal >= 0) snprintf(text, size, "%d SONGS, UP TO DATE", syncTotal);
+  else snprintf(text, size, "%s", state);
+}
+
+int takeCardSyncAdded() { const int added = syncAdded; syncAdded = 0; return added; }
 
 bool begin() {
   // Wanted again before it had ended: it just carries on.

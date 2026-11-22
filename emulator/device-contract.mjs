@@ -222,7 +222,7 @@ const trendRiseMv = Number(firmware.match(/kPowerTrendMinimumRiseMv = (\d+)/)[1]
 const trendToleranceMv = Number(firmware.match(/kPowerTrendNoiseToleranceMv = (\d+)/)[1]);
 const idleAfterInputMs = Number(firmware.match(/kPowerIdleAfterInputMs = (\d+)/)[1]);
 const fallStepMs = Number(firmware.match(/kBatteryFallStepMs = (\d+)/)[1]);
-assert.ok(riseStepMs >= 180000, 'battery estimate may rise at most 1% per three minutes');
+assert.ok(riseStepMs >= 60000, 'battery estimate may rise at most 1% a minute (60%/h, above any real charge; 1% per 3 min lagged a charging cell, emulator charge-* scenarios)');
 assert.ok(fastRiseStepMs <= 10000, 'confirmed voltage rise must accelerate the SOC estimate');
 assert.ok(trendSamples >= 5, 'charging needs multiple sustained samples');
 assert.ok(trendRiseMv >= 15, 'tiny ADC fluctuations must not imply charging');

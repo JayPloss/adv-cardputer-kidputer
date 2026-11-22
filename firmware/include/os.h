@@ -19,6 +19,10 @@ constexpr uint32_t kMediaBudget = 72 * 1024;
 // TLS allocates outside the ledger, through mbedTLS's own calls, so the broker admits by free heap.
 constexpr uint32_t kSecureAdmitFree = 80 * 1024;
 constexpr uint32_t kSecureAdmitLargest = 20 * 1024;
+// A plain HTTP connection (the home music server) takes the same one slot, with no TLS: its socket,
+// lwIP's window and a file buffer. Measured in the emulator's card-sync run.
+constexpr uint32_t kPlainAdmitFree = 40 * 1024;
+constexpr uint32_t kPlainAdmitLargest = 12 * 1024;
 
 void begin();
 void bindTask(Owner owner);
@@ -45,11 +49,19 @@ bool acquireSecure(Priority priority, uint32_t waitMs = 0);
 void releaseSecure();
 bool secureHeld();
 bool secureFits();
+// The same slot for a plain connection: one network connection at a time, of either kind.
+bool acquirePlain(Priority priority, uint32_t waitMs = 0);
+bool plainFits();
 // A media app in front needs the RAM: no new secure connection starts until it has gone.
 void holdSecure(bool hold);
 struct SecureLease {
   explicit SecureLease(Priority priority, uint32_t waitMs = 0) : held(acquireSecure(priority, waitMs)) {}
   ~SecureLease() { if (held) releaseSecure(); }
+  const bool held;
+};
+struct PlainLease {
+  explicit PlainLease(Priority priority, uint32_t waitMs = 0) : held(acquirePlain(priority, waitMs)) {}
+  ~PlainLease() { if (held) releaseSecure(); }
   const bool held;
 };
 

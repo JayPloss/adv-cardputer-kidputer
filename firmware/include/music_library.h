@@ -53,6 +53,18 @@ void setLiked(const String &trackId, bool liked);
 // A list still being fetched is no longer wanted: its answer is dropped, not shown.
 void forget();
 
+// Card sync: the owner's Navidrome playlist (named after them) mirrored into /music/<Playlist>
+// on the card as "001 Title - Artist.mp3", the names tools/sd-cards/card.py gives. Only what is
+// missing is fetched; a renumbered song is renamed, nothing is deleted. Runs on its own task,
+// one song at a time, and stops at once when asked (a media app opening, charging mode).
+void startCardSync();
+void stopCardSync(uint32_t waitMs);
+bool cardSyncRunning();
+// One line for STATUS: "33 SONGS, UP TO DATE", "GETTING 2 OF 5", "NO PLAYLIST", ...
+void cardSyncText(char *text, size_t size);
+// Songs added since the last call, for a notice on HOME.
+int takeCardSyncAdded();
+
 Status status();
 const char *failure();
 // Copies the finished list out for the screen; false until there is a new one.
