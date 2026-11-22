@@ -3382,11 +3382,11 @@ void setIdleClock(bool shown) {
 // Left open on the idle clock, a Cardputer ran from full to empty overnight (Jay, 2026-11-22): the clock kept
 // Wi-Fi connected, the CPU at full speed and the backlight on. After a while on the idle clock it sleeps for
 // real: screen and backlight off, radio off, the chip in light sleep. Any key (the keyboard chip's interrupt
-// line, GPIO11) or the rear button (GPIO0) wakes it, and that key does nothing else; a timer wakes it every
-// 30 s (or at a running timer's end) so alarms, the timer and screen time still ring on time. Messages are
-// fetched when it wakes. It never sleeps while something plays, rings, records, charges or syncs.
+// line, GPIO11) or the rear button (GPIO0) wakes it, and that key does nothing else. Otherwise it wakes only
+// when something is due: a running timer's or a snooze's end, or an alarm's minute (sleepWakeInMs). Messages are
+// fetched when it wakes. It never sleeps while something plays, rings, records, charges or syncs, or while a
+// screen-time session counts down.
 constexpr uint32_t kSleepAfterMs = 10 * 60000u;   // without a key; the idle clock comes at 2 minutes
-constexpr uint32_t kSleepWakeEveryMs = 30000u;
 constexpr gpio_num_t kKeyboardInterruptPin = GPIO_NUM_11;
 constexpr gpio_num_t kRearButtonPin = GPIO_NUM_0;
 bool sleeping = false;
@@ -3394,7 +3394,9 @@ bool sleeping = false;
 bool sleepAllowed() {
   return idleClockShown && idleClockAllowed() && !media::active() && !mediaStarting && !mediaTasksWanted &&
          !chargingModeActive && !library::cardSyncRunning() && !walkieConnected && alarmSong == AlarmSong::None &&
-         !messageNotificationActive && !messageNotificationPending && !audioPlaying;
+         !messageNotificationActive && !messageNotificationPending && !audioPlaying &&
+         // A screen-time session counting down: someone may be using it without keys, and its warnings must show.
+         screenTime.countdown.state != clockapps::Countdown::State::Running;
 }
 
 void enterSleep() {
@@ -3418,14 +3420,31 @@ void leaveSleep(const char *why) {
   Serial.printf("SLEEP left: %s\n", why);
 }
 
-// One light sleep: until a key, the rear button, the next 30 s or a running timer's end. True if a key or the
-// button woke it.
-bool sleepOnce() {
-  uint32_t forMs = kSleepWakeEveryMs;
+// Milliseconds until something must wake the device: a running timer's end, a snooze's end, or the start of the
+// next alarm's minute. No radio, no internet: the chip keeps the time itself while asleep (no 32 kHz crystal on
+// the ADV, so its internal oscillator; how far that drifts over a night is measured on a device). UINT32_MAX when
+// nothing is due: only a key wakes it then.
+uint32_t sleepWakeInMs() {
   const uint32_t now = millis();
-  for (const clockapps::Countdown *countdown : {&timerCountdown, &screenTime.countdown})
-    if (countdown->state == clockapps::Countdown::State::Running) forMs = std::min(forMs, std::max<uint32_t>(countdown->leftMs(now), 1));
-  esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(forMs) * 1000);
+  uint32_t wake = UINT32_MAX;
+  if (timerCountdown.state == clockapps::Countdown::State::Running) wake = std::min(wake, std::max<uint32_t>(timerCountdown.leftMs(now), 1));
+  if (alarms.snoozed) wake = std::min(wake, clockapps::reached(now, alarms.snoozeUntil) ? 1u : alarms.snoozeUntil - now);
+  struct tm wall{};
+  if (wallClock(wall)) {
+    const int32_t minutes = alarms.minutesUntil(wall.tm_wday, wall.tm_hour, wall.tm_min);
+    if (minutes > 0) {
+      // Half a second into the alarm's minute, so the minute check sees it at once.
+      const int64_t untilRing = static_cast<int64_t>(minutes) * 60000 - static_cast<int64_t>(wall.tm_sec) * 1000 + 500;
+      wake = std::min<uint32_t>(wake, static_cast<uint32_t>(std::max<int64_t>(1, std::min<int64_t>(untilRing, UINT32_MAX - 1))));
+    }
+  }
+  return wake;
+}
+
+// One light sleep: until a key, the rear button, or the wake time. True if a key or the button woke it.
+bool sleepOnce(uint32_t forMs) {
+  if (forMs != UINT32_MAX) esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(forMs) * 1000);
+  else esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
   gpio_wakeup_enable(kKeyboardInterruptPin, GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable(kRearButtonPin, GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
@@ -3446,7 +3465,7 @@ bool serviceSleep() {
     if (sleepAllowed() && millis() - lastUserInputAt >= kSleepAfterMs) enterSleep();
     return sleeping;
   }
-  const bool byKey = sleepOnce();
+  const bool byKey = sleepOnce(sleepWakeInMs());
   M5Cardputer.update();
   if (byKey || M5Cardputer.Keyboard.isPressed() || M5Cardputer.BtnA.isPressed()) { leaveSleep("key"); return false; }
   serviceClockApps();
