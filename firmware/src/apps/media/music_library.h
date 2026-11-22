@@ -18,6 +18,8 @@ struct Item {
   uint32_t seconds = 0;
   uint32_t resumeMs = 0;
   bool liked = false;
+  bool lyrics = false;   // a card song with its timed lyrics beside it ("<title>.lrc")
+  bool checked = true;   // a card song in the folder's play list: the play modes skip unchecked ones
 };
 
 enum class Collection : uint8_t { Music, Books };
@@ -40,6 +42,9 @@ void saveCardPlace(const String &folder, const String &trackPath, uint32_t secon
 void clearCardPlace(const String &folder);
 // A song deleted on the device: off the card (to /music/.removed, recoverable) and never synced back.
 void deleteTrack(const String &folder, const String &title);
+// Checks: "<folder>/.unchecked.txt" holds the songs taken off the folder's play list (one name a line without
+// its "NNN " number), so a song new on the card starts checked. Next, previous and shuffle skip them.
+void setChecked(const String &folder, const String &title, bool checked);
 // The chapter after (or before) one on the card, found without listing the folder into RAM.
 void requestAdjacentTrack(const String &folder, const String &title, int direction);
 // direction kRandomTrack: any other song of the folder (shuffle); 1 with an empty title: the first song.

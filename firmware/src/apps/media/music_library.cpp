@@ -43,7 +43,7 @@ constexpr uint32_t kConnectTimeoutMs = 2000;
 constexpr uint32_t kServerRetryMs = 60000;
 constexpr size_t kCardTrackLimit = 300;
 
-enum class JobKind : uint8_t { CardAlbums, CardTracks, Adjacent, SavePlace, ClearPlace, Albums, Liked, Search, Tracks, SaveBookmark, DeleteBookmark, Like, Unlike, DeleteTrack };
+enum class JobKind : uint8_t { CardAlbums, CardTracks, Adjacent, SavePlace, ClearPlace, Albums, Liked, Search, Tracks, SaveBookmark, DeleteBookmark, Like, Unlike, DeleteTrack, SetChecked };
 struct Job { JobKind kind; String text; int number; Collection collection; String extra; uint32_t generation; };
 
 SemaphoreHandle_t mutex = nullptr;
@@ -309,11 +309,35 @@ bool readPlace(const String &path, String &trackPath, uint32_t &seconds) {
   return end == "ok";
 }
 
+uint32_t nameHash(const String &text);
+std::vector<uint32_t> uncheckedSet(const String &folder);
+bool inSet(const std::vector<uint32_t> &set, uint32_t hash);
+bool songChecked(const std::vector<uint32_t> &unchecked, const String &title);
+
 bool runCardTracks(const Job &job) {
   std::vector<Item> items;
   if (!readFolderList(job.text, false, kCardTrackLimit, items)) {
     failureText = SD.exists(job.text) ? kCardNotRead : "NOT ON CARD";
     return false;
+  }
+  // Lyrics and checks, for a music folder: one more pass over the folder for its .lrc names (hashed).
+  if (job.text.startsWith("/music/")) {
+    const std::vector<uint32_t> unchecked = uncheckedSet(job.text);
+    std::vector<uint32_t> lyrics;
+    char where[320];
+    snprintf(where, sizeof where, "%s%s", kCardMount, job.text.c_str());
+    if (DIR *dir = opendir(where)) {
+      while (const dirent *entry = readdir(dir)) {
+        const size_t length = strlen(entry->d_name);
+        if (entry->d_type != DT_REG || length < 5 || strcasecmp(entry->d_name + length - 4, ".lrc") != 0) continue;
+        uint32_t hash = 2166136261u;
+        for (size_t i = 0; i + 4 < length; i++) hash = (hash ^ static_cast<uint8_t>(entry->d_name[i])) * 16777619u;
+        lyrics.push_back(hash);
+      }
+      closedir(dir);
+    }
+    std::sort(lyrics.begin(), lyrics.end());
+    for (Item &item : items) { item.lyrics = inSet(lyrics, nameHash(item.title)); item.checked = songChecked(unchecked, item.title); }
   }
   String trackPath;
   uint32_t seconds = 0;
@@ -357,17 +381,57 @@ void deleteCardTrack(const String &folder, const String &title) {
   if (File list = SD.open(folder + "/.deleted.txt", FILE_APPEND)) { list.println(songTail(title)); list.close(); }
 }
 
+uint32_t nameHash(const String &text) {
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < text.length(); i++) hash = (hash ^ static_cast<uint8_t>(text[i])) * 16777619u;
+  return hash;
+}
+
+// Hashes of the folder's unchecked songs (by songTail), sorted for binary search.
+std::vector<uint32_t> uncheckedSet(const String &folder) {
+  std::vector<uint32_t> set;
+  File list = SD.open(folder + "/.unchecked.txt", FILE_READ);
+  if (!list) return set;
+  while (list.available()) { String line = list.readStringUntil('\n'); line.trim(); if (line.length()) set.push_back(nameHash(line)); }
+  list.close();
+  std::sort(set.begin(), set.end());
+  return set;
+}
+
+bool inSet(const std::vector<uint32_t> &set, uint32_t hash) { return std::binary_search(set.begin(), set.end(), hash); }
+bool songChecked(const std::vector<uint32_t> &unchecked, const String &title) { return unchecked.empty() || !inSet(unchecked, nameHash(songTail(title))); }
+
+// The whole list rewritten (a few hundred bytes): under a new name first, so a power cut keeps the old one.
+void writeChecked(const String &folder, const String &title, bool checked) {
+  const String tail = songTail(title);
+  std::vector<String> names;
+  if (File list = SD.open(folder + "/.unchecked.txt", FILE_READ)) {
+    while (list.available()) { String line = list.readStringUntil('\n'); line.trim(); if (line.length() && line != tail) names.push_back(line); }
+    list.close();
+  }
+  if (!checked) names.push_back(tail);
+  const String path = folder + "/.unchecked.txt", fresh = path + ".new";
+  if (names.empty()) { SD.remove(path); return; }
+  File out = SD.open(fresh, FILE_WRITE);
+  if (!out) return;
+  for (const auto &name : names) out.println(name);
+  out.close();
+  SD.remove(path);
+  SD.rename(fresh, path);
+}
+
 // A random song of the folder other than the one playing, for shuffle: counted on one pass, then the
 // chosen one found on a second, so the folder is never listed into RAM.
 void runRandom(const Job &job) {
   char where[320];
   snprintf(where, sizeof where, "%s%s", kCardMount, job.text.c_str());
+  const std::vector<uint32_t> unchecked = uncheckedSet(job.text);
   auto eligible = [&](const dirent *entry, String &title) {
     if (entry->d_type != DT_REG || !isMp3(entry->d_name)) return false;
     title = entry->d_name;
     if (title.length() != strlen(entry->d_name)) return false;
     title.remove(title.length() - 4);
-    return title != job.extra;
+    return title != job.extra && songChecked(unchecked, title);
   };
   int count = 0;
   String title, chosen;
@@ -395,6 +459,7 @@ void runAdjacent(const Job &job) {
   if (job.number == kRandomTrack) { runRandom(job); return; }
   String best;
   const bool forward = job.number > 0;
+  const std::vector<uint32_t> unchecked = uncheckedSet(job.text);
   char where[320];
   snprintf(where, sizeof where, "%s%s", kCardMount, job.text.c_str());
   if (DIR *dir = opendir(where)) {
@@ -403,6 +468,7 @@ void runAdjacent(const Job &job) {
       String title = entry->d_name;
       if (title.length() != strlen(entry->d_name)) continue;
       title.remove(title.length() - 4);
+      if (!songChecked(unchecked, title)) continue;
       const bool past = forward ? title > job.extra : title < job.extra;
       if (past && (best.isEmpty() || (forward ? title < best : title > best))) best = title.c_str();
     }
@@ -547,6 +613,7 @@ void workerTask(void *) {
       case JobKind::SavePlace: writeCardPlace(job); break;
       case JobKind::ClearPlace: SD.remove(placePath(job.text)); SD.remove(placePath(job.text) + ".new"); break;
       case JobKind::DeleteTrack: deleteCardTrack(job.text, job.extra); break;
+      case JobKind::SetChecked: writeChecked(job.text, job.extra, job.number != 0); break;
       case JobKind::Albums: ok = runAlbums(job); break;
       case JobKind::Liked: ok = runLiked(); break;
       case JobKind::Search: ok = runSearch(job); break;
@@ -1021,6 +1088,7 @@ void requestCardTracks(const String &folder) { enqueue({JobKind::CardTracks, fol
 void saveCardPlace(const String &folder, const String &trackPath, uint32_t seconds) { enqueue({JobKind::SavePlace, folder, static_cast<int>(seconds), Collection::Books, trackPath}, false); }
 void clearCardPlace(const String &folder) { enqueue({JobKind::ClearPlace, folder, 0, Collection::Books}, false); }
 void deleteTrack(const String &folder, const String &title) { enqueue({JobKind::DeleteTrack, folder, 0, Collection::Music, title}, false); }
+void setChecked(const String &folder, const String &title, bool checked) { enqueue({JobKind::SetChecked, folder, checked ? 1 : 0, Collection::Music, title}, false); }
 void requestAdjacentTrack(const String &folder, const String &title, int direction) { enqueue({JobKind::Adjacent, folder, direction, Collection::Books, title}, false); }
 bool takeAdjacentTrack(Item &item, bool &found) {
   if (!mutex) return false;

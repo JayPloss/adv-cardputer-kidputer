@@ -74,7 +74,7 @@ const char *failureText(const char *english) {
   if (frenchUi) for (const auto &pair : kFrench) if (!strcmp(english, pair[0])) return pair[1];
   return english;
 }
-constexpr char kFirmwareVersion[] = "v0.63";
+constexpr char kFirmwareVersion[] = "v0.64";
 // The author of the device's own notes to its owner: no account has this id.
 constexpr char kNoticeAuthor[] = "kidputer";
 // Lyrics show only when asked for: L (lyrics) in English, P (paroles) in French, turns them on and off; remembered.
@@ -2908,6 +2908,19 @@ void drawHome() {
   display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 123); display.print(uiText("ARROWS MOVE       ENTER OPEN", "FLECHES           ENTER OUVRIR"));
 }
 
+// A song list of a music folder on the card (not the alarm picker's): its songs carry checks.
+constexpr int kCheckRowChars = 35;  // 37 cells less the check's gutter
+uint32_t librarySelectedAt = 0;     // when the selection last moved: the long name's scroll starts there
+bool checkableList();
+String utf8From(const String &text, int characters) {
+  size_t at = 0;
+  for (int skipped = 0; skipped < characters && at < text.length(); skipped++) {
+    at++;
+    while (at < text.length() && (static_cast<uint8_t>(text[at]) & 0xC0) == 0x80) at++;
+  }
+  return text.substring(at);
+}
+
 void drawLibrary() {
   auto &display = uiCanvas; display.fillScreen(TFT_BLACK); drawHeader(utf8Head(libraryTitle, 16).c_str());
   const auto status = library::status();
@@ -2924,6 +2937,24 @@ void drawLibrary() {
     for (int row = 0; row < kRows && first + row < static_cast<int>(libraryItems.size()); row++) {
       const auto &item = libraryItems[first + row]; const int y = 22 + row * 14; const bool selected = first + row == librarySelection;
       display.fillRoundRect(3, y, 234, 13, 3, selected ? TFT_GREEN : TFT_BLACK);
+      if (checkableList()) {
+        // Songs with lyrics in cyan; a check in the right-hand gutter for the songs on the play list; the selected
+        // name, when too long for its row, scrolls right to left (a pause at each end).
+        display.setTextColor(selected ? TFT_BLACK : item.lyrics ? TFT_CYAN : TFT_WHITE, selected ? TFT_GREEN : TFT_BLACK);
+        display.setCursor(7, y + 3);
+        const int length = static_cast<int>(utf8CharacterCount(item.title));
+        int from = 0;
+        if (selected && length > kCheckRowChars) {
+          const int travel = length - kCheckRowChars, step = static_cast<int>((millis() - librarySelectedAt) / 250) % (travel + 16);
+          from = constrain(step - 8, 0, travel);
+        }
+        printFont0Text(utf8Head(utf8From(item.title, from), kCheckRowChars));
+        if (item.checked) {
+          const uint16_t ink = selected ? TFT_BLACK : TFT_GREEN;
+          for (int thick = 0; thick < 2; thick++) { display.drawLine(225, y + 6 + thick, 228, y + 9 + thick, ink); display.drawLine(228, y + 9 + thick, 233, y + 2 + thick, ink); }
+        }
+        continue;
+      }
       display.setTextColor(selected ? TFT_BLACK : TFT_WHITE, selected ? TFT_GREEN : TFT_BLACK); display.setCursor(7, y + 3);
       printFont0Text(utf8Head(item.title, item.resumeMs || item.liked ? 34 : 37));
       if (item.resumeMs) { display.setCursor(222, y + 3); display.print(">"); }
@@ -2931,7 +2962,8 @@ void drawLibrary() {
     }
   }
   display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 123);
-  display.print(libraryView == LibraryView::Albums ? uiText("LEFT/RIGHT PAGE  ENTER OPEN", "GAUCHE/DROITE PAGE ENTER") : uiText("UP/DOWN MOVE      ENTER OPEN", "HAUT/BAS BOUGER   ENTER OUVRIR"));
+  if (checkableList()) display.print(uiText("RIGHT ADD  LEFT REMOVE  G0 BACK", "DROITE AJOUTE GAUCHE ENLEVE G0 RETOUR"));
+  else display.print(libraryView == LibraryView::Albums ? uiText("LEFT/RIGHT PAGE  ENTER OPEN", "GAUCHE/DROITE PAGE ENTER") : uiText("UP/DOWN MOVE      ENTER OPEN", "HAUT/BAS BOUGER   ENTER OUVRIR"));
 }
 
 void drawLibrarySearch() {
@@ -4613,6 +4645,11 @@ void moveQueue(int direction) {
   queueIndex = next; startQueuedTrack(0); savePlaceAtStart(); renderDirty = true;
 }
 
+bool checkableList() {
+  return screenMode == ScreenMode::Library && libraryView == LibraryView::Tracks && tracksFromCardList &&
+         libraryCollection == library::Collection::Music && alarmSoundPick < 0 && libraryFolder.startsWith("/music/");
+}
+
 // Music's next song, by its modes: shuffle picks any other song; past the end of the list, repeat-all starts
 // over and otherwise it stops. Songs on the card come one at a time from the card (library), never a list.
 void nextMusicSong() {
@@ -4854,9 +4891,17 @@ bool handleAppKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown
   }
   if (screenMode == ScreenMode::Library) {
     const int count = static_cast<int>(libraryItems.size());
+    if (goUp || goDown) librarySelectedAt = millis();
     if (goUp && count) librarySelection = (librarySelection + count - 1) % count;
     else if (goDown && count) librarySelection = (librarySelection + 1) % count;
     else if (keys.enter) openLibrarySelection();
+    else if (checkableList() && (goLeft || goRight)) {
+      // Right puts the song on the folder's play list, Left takes it off; G0 (or the ` key) goes back.
+      if (librarySelection < count && libraryItems[librarySelection].checked != goRight) {
+        libraryItems[librarySelection].checked = goRight;
+        library::setChecked(libraryFolder, libraryItems[librarySelection].title, goRight);
+      }
+    }
     else if (libraryView == LibraryView::Albums && goRight && count == library::kPageSize) {
       libraryOffset += library::kPageSize; libraryItems.clear(); library::requestAlbums(libraryCollection, libraryOffset);
     } else if (libraryView == LibraryView::Albums && goLeft && libraryOffset > 0) {
@@ -5213,6 +5258,8 @@ static void loopBody() {
   if (screenMode == ScreenMode::Chat && chatNoticeAt && millis() - chatNoticeAt > 6000) { chatNoticeAt = 0; renderDirty = true; }
   serviceNearbySends();
   if (screenMode == ScreenMode::System && millis() - lastRenderAt >= 1000) renderDirty = true;
+  if (checkableList() && librarySelection < static_cast<int>(libraryItems.size()) && millis() - lastRenderAt >= 250 &&
+      utf8CharacterCount(libraryItems[librarySelection].title) > kCheckRowChars) renderDirty = true;
   if (renderDirty && millis() - lastRenderAt >= kRenderIntervalMs) render();
   delay(2);
 }
