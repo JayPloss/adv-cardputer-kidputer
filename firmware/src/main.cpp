@@ -5214,7 +5214,10 @@ void setup() {
   M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
   sampleBattery(true);
   drawBootSplash();
-  uiCanvas.setPsram(false); uiCanvas.setColorDepth(16);
+  uiCanvas.setPsram(false);
+  // 256 colours (RGB332): the screen buffer at 32 KB instead of 64 KB. At 16 bits it left about 79 KB free with
+  // Wi-Fi up, under what a secure connection needs, and no Cardputer reached the server (2026-11-22).
+  uiCanvas.setColorDepth(8);
   uiCanvasReady = uiCanvas.createSprite(240, 135) != nullptr; uiCanvas.setTextWrap(false);
   stateMutex = xSemaphoreCreateMutex(); bootNonce = esp_random();
   os::begin();
