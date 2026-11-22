@@ -1,12 +1,12 @@
 // Host test of the outbox and the walkie codec.
-//   g++ -std=c++11 -I firmware/include firmware/tools/messaging-test.cpp -o /tmp/messaging-test && /tmp/messaging-test
+//   g++ -std=c++11 -I firmware/include -I firmware/src firmware/tools/messaging-test.cpp -o /tmp/messaging-test && /tmp/messaging-test
 #include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <random>
 #include <vector>
-#include "outbox.h"
-#include "voice_codec.h"
+#include "apps/chat/outbox.h"
+#include "apps/chat/voice_codec.h"
 
 static double snrDb(const std::vector<int16_t> &a, const std::vector<int16_t> &b) {
   double signal = 0, noise = 0;

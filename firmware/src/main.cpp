@@ -4,11 +4,11 @@
 #include <M5Cardputer.h>
 #include <Preferences.h>
 #include "changelog.h"
-#include "clock_apps.h"
-#include "fox_finding.h"
-#include "french_keyboard.h"
-#include "outbox.h"
-#include "voice_codec.h"
+#include "apps/time/clock_apps.h"
+#include "apps/chat/fox_finding.h"
+#include "apps/system/french_keyboard.h"
+#include "apps/chat/outbox.h"
+#include "apps/chat/voice_codec.h"
 #include <WebSocketsClient.h>
 #include <SD.h>
 #include <SPI.h>
@@ -27,8 +27,8 @@
 #if __has_include("music_secrets.h")
 #include "music_secrets.h"
 #endif
-#include "keypress_song.h"
-#include "media_player.h"
+#include "apps/system/keypress_song.h"
+#include "apps/media/media_player.h"
 #include "music_library.h"
 #include "os.h"
 #include "shared_text.h"

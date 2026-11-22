@@ -1,9 +1,9 @@
 // Host test of the clock apps' arithmetic.
-//   g++ -std=c++11 -I firmware/include firmware/tools/clock-apps-test.cpp -o /tmp/clock-test && /tmp/clock-test
+//   g++ -std=c++11 -I firmware/include -I firmware/src firmware/tools/clock-apps-test.cpp -o /tmp/clock-test && /tmp/clock-test
 #include <cassert>
 #include <cstdio>
 #include <initializer_list>
-#include "clock_apps.h"
+#include "apps/time/clock_apps.h"
 
 using namespace clockapps;
 

@@ -1,13 +1,13 @@
 // Host test of the French keyboard: every required character, and every printable ASCII
 // character, can be typed; dead keys compose and undo; the KEYS screen lists what it should.
-//   g++ -std=c++11 -I firmware/include firmware/tools/french-keyboard-test.cpp -o /tmp/fr-kb && /tmp/fr-kb [--list]
+//   g++ -std=c++11 -I firmware/include -I firmware/src firmware/tools/french-keyboard-test.cpp -o /tmp/fr-kb && /tmp/fr-kb [--list]
 #include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <set>
 #include <string>
 #include <vector>
-#include "french_keyboard.h"
+#include "apps/system/french_keyboard.h"
 
 using namespace frkb;
 

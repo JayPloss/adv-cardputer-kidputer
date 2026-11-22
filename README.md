@@ -1,4 +1,40 @@
-# Cardputer ADV SupaChat
+# Kidputer
+
+A multi-function pal for kids too young for a phone, on M5Stack Cardputer ADV handhelds. One firmware holds every app;
+`firmware/include/os.h` keeps them inside the device's RAM (budgets, one secure connection at a time).
+
+## Apps and functions
+
+| App (HOME label) | What it does | Code |
+|---|---|---|
+| SupaChat (`SUPACHAT`) | Family chat over ESP-NOW nearby and Wi-Fi through the Hetzner server: rooms, outbox, voice messages, walkie, fox finding, `LOCAL OFF/ON` | `firmware/src/apps/chat/`, `server/` |
+| Music (`MUSIC`) | Songs from the SD card and Navidrome, liked list, search, the owner's playlist synced to the card | `firmware/src/apps/media/` |
+| Audiobooks (`BOOKS`) | Books from the card and Navidrome, school-night stop on the children's devices | `firmware/src/apps/media/` |
+| Time (`TIMER`, `ALARM`, `STOPWATCH`, `SCREEN`) | Timer, alarm with songs, stopwatch, screen-time limit | `firmware/src/apps/time/` |
+| Remote control (`R/C`) | Placeholder: nothing connected yet | `firmware/src/main.cpp` |
+| Utilities (`WI-FI`, `VOLUME`, `STATUS`, `LANGUAGE`, `CHARGING`, `CHANGELOG`, `SYSTEM`) | English/French interface and Canadian French keyboard, key help, emoji, keypress song, charging mode, idle clock and dimming | `firmware/src/apps/system/`, `firmware/src/main.cpp` |
+
+The home screen, main loop, power and idle handling, and most screens still live in `firmware/src/main.cpp`;
+the app folders hold the modules already split out of it.
+
+## Repository layout
+
+```text
+adv-cardputer-kidputer/
+  firmware/            one PlatformIO project, one binary for every device
+    include/           os.h, changelog, splash logos, gitignored secrets headers
+    src/main.cpp       home screen, loop, screens
+    src/apps/<app>/    each app's modules
+    tools/ lab/        host tests, upload gate, labs
+  server/              SupaChat's server (Hetzner)
+  emulator/            browser mock of the UI and contract tests
+  tools/sd-cards/      loading songs and books onto cards, wolfpack-sync
+  skills/ docs/
+```
+
+The runtime emulator is `JayPloss/cardputer-emulator`, checked out beside this repo.
+
+# SupaChat
 
 Persistent private mesh chat for Cardputer ADV handhelds using ESP-NOW for infrastructure-free peer-to-peer communication and optional WiFi backhaul through a Hetzner-hosted peer.
 
@@ -45,13 +81,13 @@ issues and their acceptance criteria are tracked in
 
 The device boots through the SupaChat splash to a HOME screen of apps, four to a page. Page 1 has SUPACHAT, MUSIC, BOOKS and R/C. Page 2 has the clock apps: TIMER, ALARM, SCREEN (screen time) and STOPWATCH. Page 3 has the settings: WI-FI, VOLUME, STATUS and LANGUAGE. Page 4 has CHARGING, LOCAL, CHANGELOG and SYSTEM. The arrows move between apps and on to the next page; going past the first or last page gives a bump and a falling tone. Enter or keys 1-4 open an app on the page, and key 0 opens SYSTEM. The rear button goes back one level; the top-left key does too (Fn + that key while typing).
 
-MUSIC and BOOKS stream from Navidrome on the home LAN over the Subsonic API: plain HTTP, MP3 only, decoded with libhelix on a dedicated task (`firmware/src/media_player.cpp`, `firmware/src/music_library.cpp`). The Cardputer ADV has no PSRAM, so all audio buffers live in internal RAM and are released when playback stops. While media plays, the walkie socket closes and chat polls once a minute. Starting a walkie recording, charging mode or ESP-NOW local mode stops playback first.
+MUSIC and BOOKS stream from Navidrome on the home LAN over the Subsonic API: plain HTTP, MP3 only, decoded with libhelix on a dedicated task (`firmware/src/apps/media/media_player.cpp`, `firmware/src/music_library.cpp`). The Cardputer ADV has no PSRAM, so all audio buffers live in internal RAM and are released when playback stops. While media plays, the walkie socket closes and chat polls once a minute. Starting a walkie recording, charging mode or ESP-NOW local mode stops playback first.
 
 **Sleep timer** (v0.60). On the now-playing screen, T sets 15, 30, 45 or 60 minutes, then off; the time left shows beside PLAYING (SLEEP, DODO in French) and on the big clock. Over its last 30 seconds the sound fades, then playback pauses with a book's place saved. A book started or resumed from 19:00 to 05:00 gets 30 minutes on its own. The runtime emulator's `book-sleep` scenario runs it.
 
 **School nights** (v0.60, the children's devices: every build but Papa's and Mama's). Sunday to Thursday, a book playing at 21:20 gets a banner (SCHOOL NIGHT, then BOOK STOPS AT 21:30; SOIR D'ECOLE, LIVRE: ARRET 21:30) and a chime, once a night, and its sleep timer is cut to end at 21:30, when the book fades and pauses with its place saved. It can be started again: that gets the bedtime 30 minutes and no second warning. School nights are the weekdays for now; holidays will come from the server. The runtime emulator's `school-night` scenario runs it.
 
-Card files are found by `firmware/include/mp3_probe.h` (since `v0.59`): past any ID3v2 tag, cover art included, and any junk, onto two frames in a row; a Xing/Info or VBRI header gives a VBR file its real length and seek table. Streams drop a leading ID3v2 tag too. What can't play says why: `8-12 KHZ MP3: UNSUPPORTED` (MPEG 2.5: the pinned libhelix is built without it), `MP2, NOT MP3`, `NOT AN MP3`. `firmware/tools/mp3-fixtures.py` makes one file of each kind and `firmware/tools/mp3-probe-test.cpp` checks the probe against them on the PC; the runtime emulator's `card-formats` scenario plays them through the real firmware.
+Card files are found by `firmware/src/apps/media/mp3_probe.h` (since `v0.59`): past any ID3v2 tag, cover art included, and any junk, onto two frames in a row; a Xing/Info or VBRI header gives a VBR file its real length and seek table. Streams drop a leading ID3v2 tag too. What can't play says why: `8-12 KHZ MP3: UNSUPPORTED` (MPEG 2.5: the pinned libhelix is built without it), `MP2, NOT MP3`, `NOT AN MP3`. `firmware/tools/mp3-fixtures.py` makes one file of each kind and `firmware/tools/mp3-probe-test.cpp` checks the probe against them on the PC; the runtime emulator's `card-formats` scenario plays them through the real firmware.
 
 Card lists (books, card albums, chapters) are read with `readdir`, which allocates nothing per entry, and count only when two passes in a row agree (since `v0.59`). The core's `openNextFile` opened every entry, and one refused allocation (the app's budget, or the floor while Wi-Fi scans away from home) ended its loop as if the folder had ended: a short list offline, and on the next String move from that failed allocation, a crash. A list that can't be read whole says `CARD NOT READ: LOW RAM`. The runtime emulator's `books-flaky` scenario refuses every Nth allocation on the list task and checks the whole list or that message.
 
@@ -79,7 +115,7 @@ What the alarm depends on:
 - **It rings only while the device is on.** The firmware never uses light or deep sleep, so a dark screen or charging mode doesn't stop it; the power switch, a flat battery or a restart before Wi-Fi does. A missed alarm is not rung later.
 - Timers, screen time and the stopwatch run on the chip's millisecond counter and don't need the clock, but they are lost if the device restarts.
 
-The arithmetic lives in `firmware/include/clock_apps.h`, tested on the PC by `firmware/tools/clock-apps-test.cpp`. The runtime emulator's `clock-timer`, `clock-screen`, `clock-alarm`, `clock-alarm-typing` `clock-noclock`, `clock-idle` and `alarm-song` scenarios run the real firmware through each app.
+The arithmetic lives in `firmware/src/apps/time/clock_apps.h`, tested on the PC by `firmware/tools/clock-apps-test.cpp`. The runtime emulator's `clock-timer`, `clock-screen`, `clock-alarm`, `clock-alarm-typing` `clock-noclock`, `clock-idle` and `alarm-song` scenarios run the real firmware through each app.
 
 ### Putting it on the devices
 
@@ -198,7 +234,7 @@ Since `v0.57` Wi-Fi power saving (modem sleep) is on only while the server answe
 
 ### Messages: the outbox, the marks, and ONLINE or NEARBY
 
-Since `v0.57`. Every typed message goes into an outbox kept in NVS (`firmware/include/outbox.h`, up to 16), whatever room it belongs to, and leaves it only when the server answers that it stored it. A missing answer (no Wi-Fi, DNS, a blocked port, TLS, a 5xx) is retried with a growing wait from 5 seconds to 5 minutes. A refusal (400, 401, 403, 409) marks the message FAILED in red; it stays until the person selects it (Fn+Up) and presses Enter. A full outbox refuses the next message and says so, leaving the text in the composer. Unsent messages are never pushed off the 40-message list, and messages left unsent on the card by older firmware join the outbox when their room loads.
+Since `v0.57`. Every typed message goes into an outbox kept in NVS (`firmware/src/apps/chat/outbox.h`, up to 16), whatever room it belongs to, and leaves it only when the server answers that it stored it. A missing answer (no Wi-Fi, DNS, a blocked port, TLS, a 5xx) is retried with a growing wait from 5 seconds to 5 minutes. A refusal (400, 401, 403, 409) marks the message FAILED in red; it stays until the person selects it (Fn+Up) and presses Enter. A full outbox refuses the next message and says so, leaving the text in the composer. Unsent messages are never pushed off the 40-message list, and messages left unsent on the card by older firmware join the outbox when their room loads.
 
 Each message of this device's carries a mark at the right of its last line: a small grey clock while it waits, a yellow tick once a nearby device has acknowledged its ESP-NOW copy, a grey tick on the server, two grey ticks delivered to another device, two cyan ticks read.
 
@@ -214,7 +250,7 @@ STATUS (page 1 of 3) shows, large: the mode (ONLINE, NEARBY ONLY, OFFLINE), then
 
 ### Typing in French
 
-Since `v0.58`. When the interface is French, chat types the Canadian French CSA layout (the one in xkb's `ca(multix)`), read from where each key sits, since the keycaps are English. The table is `firmware/include/french_keyboard.h`; `firmware/tools/french-keyboard-test.cpp` proves every character the kids need (`? ! . , ; : ' " ( ) - _ @ # /`, é è ê à â ç ù û ô î ï ë « ») and every printable ASCII character can be typed. The main moves from the keycaps: Shift+6 is `?`, `/` is é, `'` is è, `\` is à, `]` is ç, the top-left key is `/`, Shift+, and Shift+. are `'` and `"`. `[` is a dead key for ^ (then a letter: ê), Shift+`[` for ¨ and Alt+`[` for the grave accent; Space after it types the accent alone. Alt is CSA's AltGr: Alt+Z and Alt+X are « », Alt+U is ù (CSA's own ù key is missing on the Cardputer), Alt+7, 8, 9, 0 are { } [ ]. Tab in chat opens TOUCHES, a page of every combination not printed on its keycap, generated from the same table. Wi-Fi passwords and music search type the keycaps in both languages. Font0 has no capital À Â È Ê Ë Î Ï Ô Ù Û, so the screen draws those as the plain capital; the message keeps the accent.
+Since `v0.58`. When the interface is French, chat types the Canadian French CSA layout (the one in xkb's `ca(multix)`), read from where each key sits, since the keycaps are English. The table is `firmware/src/apps/system/french_keyboard.h`; `firmware/tools/french-keyboard-test.cpp` proves every character the kids need (`? ! . , ; : ' " ( ) - _ @ # /`, é è ê à â ç ù û ô î ï ë « ») and every printable ASCII character can be typed. The main moves from the keycaps: Shift+6 is `?`, `/` is é, `'` is è, `\` is à, `]` is ç, the top-left key is `/`, Shift+, and Shift+. are `'` and `"`. `[` is a dead key for ^ (then a letter: ê), Shift+`[` for ¨ and Alt+`[` for the grave accent; Space after it types the accent alone. Alt is CSA's AltGr: Alt+Z and Alt+X are « », Alt+U is ù (CSA's own ù key is missing on the Cardputer), Alt+7, 8, 9, 0 are { } [ ]. Tab in chat opens TOUCHES, a page of every combination not printed on its keycap, generated from the same table. Wi-Fi passwords and music search type the keycaps in both languages. Font0 has no capital À Â È Ê Ë Î Ï Ô Ù Û, so the screen draws those as the plain capital; the message keeps the accent.
 
 ### SupaChat's menu
 
@@ -325,7 +361,7 @@ No usable WSS -> level control -> IMA ADPCM, 30 ms a packet -> AES-256-GCM -> ES
                -> nearby Cardputer: 90 ms jitter buffer, lost frames covered -> speaker, 60 ms blocks
 ```
 
-Since `v0.57` (`firmware/include/voice_codec.h`, tested by `firmware/tools/messaging-test.cpp`). Before, nearby audio was raw PCM in 71-sample pieces, 150 broadcast packets a second with no acknowledgement, each played the moment it landed with about 18 ms queued at the speaker: every lost packet and every main-loop stall longer than 18 ms was a hole, which is the rough, choppy sound. Now one packet carries 30 ms (128 bytes of ADPCM, 26 dB SNR on a test signal), each goes out again with the next, the receiver waits 90 ms before playing, puts frames back in order, and covers a missing frame by repeating the last one at half level, twice, then silence. The first talker keeps the channel until they stop. Walkie-socket audio (and raw audio from older firmware) waits for a 240 ms cushion. The microphone gain went from 48 to M5's default 16, and a level control (DC blocker, slow gain up to 6x, fast gain down, limiter at 30000) follows it.
+Since `v0.57` (`firmware/src/apps/chat/voice_codec.h`, tested by `firmware/tools/messaging-test.cpp`). Before, nearby audio was raw PCM in 71-sample pieces, 150 broadcast packets a second with no acknowledgement, each played the moment it landed with about 18 ms queued at the speaker: every lost packet and every main-loop stall longer than 18 ms was a hole, which is the rough, choppy sound. Now one packet carries 30 ms (128 bytes of ADPCM, 26 dB SNR on a test signal), each goes out again with the next, the receiver waits 90 ms before playing, puts frames back in order, and covers a missing frame by repeating the last one at half level, twice, then silence. The first talker keeps the channel until they stop. Walkie-socket audio (and raw audio from older firmware) waits for a 240 ms cushion. The microphone gain went from 48 to M5's default 16, and a level control (DC blocker, slow gain up to 6x, fast gain down, limiter at 30000) follows it.
 
 What software can't change: the Cardputer's small chip antenna and the hand around it set the range; ESP-NOW broadcasts go out at 1 Mbit/s, the most robust 2.4 GHz rate, without retries; devices on different Wi-Fi channels (one joined to a network, one not) can't hear each other at all; the speaker is small and the audio 8 kHz. ESP-NOW's long-range mode (250 or 500 kbit/s) could reach further, but only between devices that all have it on, and nothing here has measured it; it is not enabled.
 
@@ -461,19 +497,7 @@ These are measurement and engineering risks, not reasons to weaken the offline-f
 - The children using the devices should understand what the system records and does not record.
 - Privacy claims in the interface and documentation must remain literally true.
 
-## Planned repository layout
-
-```text
-cardputer-adv-supachat/
-  README.md
-  docs/
-    architecture.md
-    protocol.md
-    decisions/
-  firmware/
-  server/
-  web/
-```
+## Conventions
 
 Files and directories use lowercase hyphenated names. Commits should be lowercase, imperative, and limited to one logical change. Documentation should preserve the reasons behind decisions, not merely describe the resulting code.
 

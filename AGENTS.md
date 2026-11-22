@@ -1,4 +1,6 @@
-# SupaChat workspace guardrails
+# Kidputer workspace guardrails
+
+Kidputer: one firmware of apps for pre-phone-age kids on the Cardputer ADV (SupaChat, music, books, clock apps, utilities). The apps list and folder layout are in `README.md`; app modules live in `firmware/src/apps/<app>/`, shared budgets in `firmware/include/os.h`, SupaChat's server in `server/`.
 
 ## Device identification
 

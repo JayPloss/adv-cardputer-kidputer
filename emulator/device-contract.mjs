@@ -9,7 +9,7 @@ assert.match(firmware, /EMOJI RECIPES/);
 assert.match(firmware, /ScreenMode::EmojiRecipes/);
 assert.match(firmware, /reply_to_id/);
 assert.match(firmware, /historyOffset > 0 && index == end - 1/);
-const songHeader = fs.readFileSync(new URL('../firmware/include/keypress_song.h', import.meta.url), 'utf8');
+const songHeader = fs.readFileSync(new URL('../firmware/src/apps/system/keypress_song.h', import.meta.url), 'utf8');
 const installedFonts = fs.readFileSync(new URL('../firmware/.pio/libdeps/emmanuelle/M5GFX/src/lgfx/v1/lgfx_fonts.cpp', import.meta.url), 'utf8');
 const installedGlcdFont = fs.readFileSync(new URL('../firmware/.pio/libdeps/emmanuelle/M5GFX/src/lgfx/Fonts/glcdfont.h', import.meta.url), 'utf8');
 const pinMatch = firmware.match(/kTlsFingerprint\[\] = "([0-9A-Fa-f :]+)"/);
@@ -82,14 +82,14 @@ assert.deepEqual(interpretRawKeys('menu',{word:['/'],keyList:rightKey}),{kind:'n
 assert.deepEqual(interpretRawKeys('menu',{fn:true,word:['/'],keyList:rightKey}),{kind:'ignored'},
   'navigation screens use the primary unmodified arrow layer');
 // The French layout lives in one table, and the browser mock's copy of it must match it.
-const frenchHeader = fs.readFileSync(new URL('../firmware/include/french_keyboard.h', import.meta.url), 'utf8');
+const frenchHeader = fs.readFileSync(new URL('../firmware/src/apps/system/french_keyboard.h', import.meta.url), 'utf8');
 const level = String.raw`(FRKB_N|FRKB_D\(\w+\)|FRKB_T\((?:u8)?"(?:\\.|[^"\\])*"\))`;
 const keyRow = new RegExp(String.raw`\{(\d+), (\d+), '(\\.|[^'\\])', '(\\.|[^'\\])', ` + [level, level, level, level].join(', ') + String.raw`\}`, 'g');
 const unescapeC = text => text.replace(/\\(.)/g, '$1');
 const parseLevel = text => text === 'FRKB_N' ? null : text.startsWith('FRKB_D') ? {dead: text.slice(7, -1)} : unescapeC(text.match(/^FRKB_T\((?:u8)?"(.*)"\)$/)[1]);
 const headerKeys = [...frenchHeader.matchAll(keyRow)].map(m => [Number(m[1]), Number(m[2]), unescapeC(m[3]), unescapeC(m[4]), ...m.slice(5, 9).map(parseLevel)]);
 assert.equal(headerKeys.length, 47, 'every typing key of the Cardputer is in the French table');
-assert.deepEqual(frenchKeys, headerKeys, 'emulator/state.mjs frenchKeys must match firmware/include/french_keyboard.h');
+assert.deepEqual(frenchKeys, headerKeys, 'emulator/state.mjs frenchKeys must match firmware/src/apps/system/french_keyboard.h');
 const headerCompositions = {};
 for (const m of frenchHeader.matchAll(/\{Dead::(\w+), '(.)', (?:u8)?"([^"]*)"\}/g)) (headerCompositions[m[1]] ??= {})[m[2]] = m[3];
 assert.deepEqual(frenchCompositions, headerCompositions, 'emulator/state.mjs frenchCompositions must match the firmware');

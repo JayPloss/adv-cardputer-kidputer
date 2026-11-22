@@ -4,7 +4,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
-const header=fs.readFileSync(path.join(root,'firmware/include/fox_finding.h'),'utf8');
+const header=fs.readFileSync(path.join(root,'firmware/src/apps/chat/fox_finding.h'),'utf8');
 assert.match(header,/kMaxPlacePrintEntries = 12/);
 assert.match(header,/sizeof\(PlacePrint\) <= 104/);
 assert.match(header,/kMaxPackHunters = 6/);

@@ -19,7 +19,7 @@ pl = json.loads((data / "playlists.json").read_text())
 files = json.loads((data / "files.json").read_text())
 out = data / "lyrics"
 out.mkdir(exist_ok=True)
-AGENT = "cardputer-wolfpack-lyrics (github.com/JayPloss/cardputer-adv-supachat)"
+AGENT = "cardputer-wolfpack-lyrics (github.com/JayPloss/adv-cardputer-kidputer)"
 
 
 def lrclib(path, **query):

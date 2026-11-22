@@ -1,6 +1,6 @@
 // Host test of mp3_probe.h against real files from mp3-fixtures.py.
 //   uv run --with mutagen python -I firmware/tools/mp3-fixtures.py /tmp/mp3fx
-//   g++ -std=c++14 -I firmware/include firmware/tools/mp3-probe-test.cpp -o /tmp/mp3-test && /tmp/mp3-test /tmp/mp3fx
+//   g++ -std=c++14 -I firmware/include -I firmware/src firmware/tools/mp3-probe-test.cpp -o /tmp/mp3-test && /tmp/mp3-test /tmp/mp3fx
 // Each file: found or refused as the manifest says, its length within a second of ffprobe's, and a seek
 // to the middle landing on a frame header within one frame of it.
 #include <cmath>
@@ -10,7 +10,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include "mp3_probe.h"
+#include "apps/media/mp3_probe.h"
 
 int main(int argc, char **argv) {
   const std::string dir = argc > 1 ? argv[1] : "/tmp/mp3fx";

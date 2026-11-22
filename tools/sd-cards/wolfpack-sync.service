@@ -5,6 +5,6 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 -I %h/Work/cardputer-adv-supachat/tools/sd-cards/wolfpack-sync.py
+ExecStart=/usr/bin/python3 -I %h/Work/adv-cardputer-kidputer/tools/sd-cards/wolfpack-sync.py
 Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin
 TimeoutStartSec=2h
