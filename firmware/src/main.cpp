@@ -79,6 +79,12 @@ constexpr char kFirmwareVersion[] = "v0.62";
 constexpr char kNoticeAuthor[] = "kidputer";
 // Lyrics show only when asked for: L (lyrics) in English, P (paroles) in French, turns them on and off; remembered.
 bool lyricsWanted = false;
+// The music player's modes, remembered: shuffle (M, MIX / MELANGER) and repeat (R, REPEAT / REPETER: off,
+// the whole list, one song). Books always play in order.
+enum class Repeat : uint8_t { Off, All, One };
+Repeat repeatMode = Repeat::Off;
+bool shuffleOn = false;
+bool wrapRequested = false;  // repeat-all asked the card for its first song once: no loop on an empty folder
 constexpr size_t kMessageLimit = 140;
 constexpr size_t kHistoryLimit = 100;  // What the first sync fetches; older pages go to the card.
 constexpr size_t kRamMessageLimit = 40;
@@ -960,6 +966,8 @@ void loadConfiguration() {
   }
   persistedBatteryLevel = preferences.getInt("battery_soc", -1);
   lyricsWanted = preferences.getBool("lyrics", false);
+  shuffleOn = preferences.getBool("play_mix", false);
+  repeatMode = static_cast<Repeat>(std::min<uint8_t>(preferences.getUChar("play_rep", 0), 2));
   if (persistedBatteryLevel < 0 || persistedBatteryLevel > 100) persistedBatteryLevel = -1;
   const int count = preferences.getUChar("wifi_count", 0);
   for (int index = 0; index < count && index < 12; index++) {
@@ -2980,6 +2988,8 @@ void wrapLyric(const String &text, String rows[kLyricRows]) {
   if (!rest.isEmpty()) rows[kLyricRows - 1] = utf8Head(rows[kLyricRows - 1], 18) + "~";
 }
 
+String playModesText();
+
 void drawNowPlaying() {
   auto &display = uiCanvas; display.fillScreen(TFT_BLACK); drawHeader(queueCollection == library::Collection::Books ? uiText("BOOKS", "LIVRES") : uiText("MUSIC", "MUSIQUE"));
   const auto *item = nowPlayingItem();
@@ -3001,7 +3011,9 @@ void drawNowPlaying() {
     for (int row = 0; row < kLyricRows; row++) { display.setCursor(6, 45 + row * 18); printFont0Text(rows[row]); }
     display.setTextSize(1);
     const int after = lyricShown + 1;
-    if (after < static_cast<int>(lyricLines.size())) { display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 100); printFont0Text(utf8Head(lyricLines[after].text, 38)); }
+    const String modes = playModesText();
+    if (after < static_cast<int>(lyricLines.size())) { display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 100); printFont0Text(utf8Head(lyricLines[after].text, modes.length() ? 37 - modes.length() : 38)); }
+    if (modes.length()) { display.setTextColor(TFT_CYAN, TFT_BLACK); display.setCursor(234 - static_cast<int>(modes.length()) * 6, 100); display.print(modes); }
     stateY = 24;
   } else {
     display.setTextColor(TFT_WHITE, TFT_BLACK); display.setCursor(6, 28); printFont0Text(utf8Head(item->title, 38));
@@ -3010,6 +3022,8 @@ void drawNowPlaying() {
     if (duration) display.fillRoundRect(7, 61, std::min<uint64_t>(226, 226ULL * position / duration), 6, 2, TFT_GREEN);
     display.setTextColor(TFT_WHITE, TFT_BLACK); display.setCursor(6, 74); display.print(clockText(position));
     const String total = clockText(duration); display.setCursor(234 - static_cast<int>(total.length()) * 6, 74); display.print(total);
+    const String modes = playModesText();
+    if (modes.length()) { display.setTextColor(TFT_CYAN, TFT_BLACK); display.setCursor(120 - static_cast<int>(modes.length()) * 3, 74); display.print(modes); }
   }
   const bool lyricsShown = lyricsWanted && !lyricLines.empty();
   display.setCursor(lyricsShown ? 174 : 6, stateY);
@@ -3029,7 +3043,10 @@ void drawNowPlaying() {
   display.setTextColor(TFT_DARKGREY, TFT_BLACK);
   display.setCursor(6, 110);
   const bool lyricsHere = queueCollection == library::Collection::Music && !lyricLines.empty();
+  // The music player's first hint line takes turns, 3 s each, with the modes' keys: both don't fit.
+  const bool modesHint = queueCollection == library::Collection::Music && millis() / 3000 % 2 == 1;
   if (lyricsShown) display.print(uiText("LEFT/RIGHT SONG", "GAUCHE/DROITE"));
+  else if (modesHint) display.print(uiText("M MIX   R REPEAT", "M MELANGER   R REPETER"));
   else if (lyricsHere) display.print(uiText("LEFT/RIGHT SONG UP/DOWN VOL L LYRICS", "GAUCHE/DROITE HAUT/BAS VOL P PAROLES"));
   else display.print(queueCollection == library::Collection::Books ? uiText("LEFT/RIGHT 30s    UP/DOWN VOL", "GAUCHE/DROITE 30s HAUT/BAS VOL") : uiText("LEFT/RIGHT SONG   UP/DOWN VOL", "GAUCHE/DROITE     HAUT/BAS VOL"));
   display.setCursor(6, 123);
@@ -4504,6 +4521,37 @@ void moveQueue(int direction) {
   queueIndex = next; startQueuedTrack(0); savePlaceAtStart(); renderDirty = true;
 }
 
+// Music's next song, by its modes: shuffle picks any other song; past the end of the list, repeat-all starts
+// over and otherwise it stops. Songs on the card come one at a time from the card (library), never a list.
+void nextMusicSong() {
+  if (queueIndex < 0 || queueIndex >= static_cast<int>(playQueue.size())) return;
+  if (playQueue[queueIndex].onCard) { moveQueue(shuffleOn ? library::kRandomTrack : 1); return; }
+  int next = queueIndex + 1;
+  if (shuffleOn && playQueue.size() > 1) { do next = static_cast<int>(esp_random() % playQueue.size()); while (next == queueIndex); }
+  else if (next >= static_cast<int>(playQueue.size())) {
+    if (repeatMode != Repeat::All) { media::stop(); return; }
+    next = 0;
+  }
+  stopMediaNow(); queueIndex = next; startQueuedTrack(0); renderDirty = true;
+}
+
+void savePlayModes() {
+  preferences.begin("supachat", false);
+  preferences.putBool("play_mix", shuffleOn); preferences.putUChar("play_rep", static_cast<uint8_t>(repeatMode));
+  preferences.end();
+}
+
+// The modes' tag on the player, empty when both are off: "MIX RPT1" / "MEL REP1".
+String playModesText() {
+  if (queueCollection != library::Collection::Music) return "";
+  String text = shuffleOn ? uiText("MIX", "MEL") : "";
+  if (repeatMode != Repeat::Off) {
+    if (text.length()) text += " ";
+    text += repeatMode == Repeat::One ? uiText("RPT1", "REP1") : uiText("RPT", "REP");
+  }
+  return text;
+}
+
 // Which app the current screen belongs to; chat owns its own screens and the settings belong to no app.
 os::Owner frontApp() {
   switch (screenMode) {
@@ -4621,7 +4669,16 @@ void serviceMedia() {
     adjacentWanted = false;
     if (adjacentFound) {
       playQueue[queueIndex] = adjacent;
+      wrapRequested = false;
       startQueuedTrack(0); savePlaceAtStart();
+    } else if (queueCollection == library::Collection::Music && (!queueEnded || repeatMode == Repeat::All) && !wrapRequested) {
+      // Past the last song on the card: from the first again, when it ended with repeat-all on, or when Right
+      // asked for a next song (it had already stopped the one playing, which left the player stopped).
+      wrapRequested = true;
+      library::requestAdjacentTrack(queueFolder, "", 1);
+      adjacentWanted = true;
+      renderDirty = true;
+      return;
     } else if (queueEnded && queueCollection == library::Collection::Books) {
       library::clearCardPlace(queueFolder);  // The last chapter ended: the book is finished.
     }
@@ -4634,6 +4691,13 @@ void serviceMedia() {
   if (state != lastState) { lastState = state; renderDirty = true; }
   if (state == media::State::Ended && !adjacentWanted) {
     const auto *item = nowPlayingItem();
+    if (item && queueCollection == library::Collection::Music) {
+      media::stop();
+      if (repeatMode == Repeat::One) { startQueuedTrack(0); return; }
+      queueEnded = item->onCard;
+      nextMusicSong();
+      return;
+    }
     if (item && item->onCard) { queueEnded = true; media::stop(); moveQueue(1); }
     else if (queueIndex + 1 < static_cast<int>(playQueue.size())) moveQueue(1);
     else {
@@ -4723,7 +4787,7 @@ bool handleAppKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown
       const uint32_t position = media::positionSeconds();
       const uint32_t target = goRight ? position + kBookSkipSeconds : (position > kBookSkipSeconds ? position - kBookSkipSeconds : 0);
       stopMediaNow(); startQueuedTrack(target);
-    } else moveQueue(goRight ? 1 : -1);
+    } else if (goRight) nextMusicSong(); else moveQueue(-1);
   } else {
     for (const auto character : keys.word) {
       if (character == 's' || character == 'S') { stopMediaNow(); goBackFromApp(); }
@@ -4733,6 +4797,11 @@ bool handleAppKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown
         M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
       }
       // Each key is the first letter of the word its hint shows: L LYRICS / P PAROLES, F FAVOURITE / A AIME.
+      else if (tolower(character) == 'm' && queueCollection == library::Collection::Music) { shuffleOn = !shuffleOn; savePlayModes(); }
+      else if (tolower(character) == 'r' && queueCollection == library::Collection::Music) {
+        repeatMode = repeatMode == Repeat::Off ? Repeat::All : repeatMode == Repeat::All ? Repeat::One : Repeat::Off;
+        savePlayModes();
+      }
       else if (tolower(character) == (frenchUi ? 'p' : 'l') && queueCollection == library::Collection::Music) {
         if (lyricLines.empty() && !lyricsWanted) bumpHome(0);  // This song has no timed lyrics: nothing to turn on.
         else { lyricsWanted = !lyricsWanted; preferences.begin("supachat", false); preferences.putBool("lyrics", lyricsWanted); preferences.end(); }

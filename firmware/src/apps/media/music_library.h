@@ -40,6 +40,8 @@ void saveCardPlace(const String &folder, const String &trackPath, uint32_t secon
 void clearCardPlace(const String &folder);
 // The chapter after (or before) one on the card, found without listing the folder into RAM.
 void requestAdjacentTrack(const String &folder, const String &title, int direction);
+// direction kRandomTrack: any other song of the folder (shuffle); 1 with an empty title: the first song.
+constexpr int kRandomTrack = 2;
 // True once the answer is in; found says whether there was one.
 bool takeAdjacentTrack(Item &item, bool &found);
 void requestLiked();

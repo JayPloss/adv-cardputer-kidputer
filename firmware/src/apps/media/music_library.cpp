@@ -325,7 +325,42 @@ bool runCardTracks(const Job &job) {
   return true;
 }
 
+// A random song of the folder other than the one playing, for shuffle: counted on one pass, then the
+// chosen one found on a second, so the folder is never listed into RAM.
+void runRandom(const Job &job) {
+  char where[320];
+  snprintf(where, sizeof where, "%s%s", kCardMount, job.text.c_str());
+  auto eligible = [&](const dirent *entry, String &title) {
+    if (entry->d_type != DT_REG || !isMp3(entry->d_name)) return false;
+    title = entry->d_name;
+    if (title.length() != strlen(entry->d_name)) return false;
+    title.remove(title.length() - 4);
+    return title != job.extra;
+  };
+  int count = 0;
+  String title, chosen;
+  if (DIR *dir = opendir(where)) {
+    while (const dirent *entry = readdir(dir)) if (eligible(entry, title)) count++;
+    closedir(dir);
+  }
+  if (count > 0) {
+    int pick = static_cast<int>(esp_random() % static_cast<uint32_t>(count));
+    if (DIR *dir = opendir(where)) {
+      while (const dirent *entry = readdir(dir)) if (eligible(entry, title) && pick-- == 0) { chosen = title.c_str(); break; }
+      closedir(dir);
+    }
+  }
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  adjacentItem = Item();
+  adjacentItem.onCard = true;
+  adjacentItem.title = chosen.c_str();
+  adjacentFound = chosen.length() > 0;
+  adjacentReady = true;
+  xSemaphoreGive(mutex);
+}
+
 void runAdjacent(const Job &job) {
+  if (job.number == kRandomTrack) { runRandom(job); return; }
   String best;
   const bool forward = job.number > 0;
   char where[320];
