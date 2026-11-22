@@ -545,6 +545,52 @@ bool renameRenumbered(const String &folder, const String &name) {
   return found.length() && SD.rename(folder + "/" + found, folder + "/" + name);
 }
 
+bool numbered(const char *name) {
+  return strlen(name) > 8 && isdigit(name[0]) && isdigit(name[1]) && isdigit(name[2]) && name[3] == ' ' && isMp3(name);
+}
+
+bool inManifest(const String &manifest, const char *name) {
+  File list = SD.open(manifest, FILE_READ);
+  bool found = false;
+  while (list && list.available() && !found) {
+    const String line = list.readStringUntil('\n');
+    const int tab = line.indexOf('\t');
+    found = tab > 0 && !strcmp(line.c_str() + tab + 1, name);
+  }
+  if (list) list.close();
+  return found;
+}
+
+// Songs taken off the playlist leave the kid's folder: moved, not deleted, to /music/.removed/<Playlist>
+// (hidden from the player), so one put back on the list comes back without a download. Only numbered
+// songs ("001 ..."), the sync's own names, are moved; anything else in the folder stays.
+int moveRemoved(const String &folder, const String &manifest, int total) {
+  int songs = 0;
+  if (DIR *dir = opendir((String(kCardMount) + folder).c_str())) {
+    for (const dirent *entry; (entry = readdir(dir));) songs += numbered(entry->d_name);
+    closedir(dir);
+  }
+  if (songs <= total) return 0;  // Nothing extra: no need to read the list against every file.
+  const String bin = "/music/.removed/" + folder.substring(folder.lastIndexOf('/') + 1);
+  if (!SD.exists("/music/.removed")) SD.mkdir("/music/.removed");
+  if (!SD.exists(bin)) SD.mkdir(bin);
+  int moved = 0;
+  for (bool again = true; again && !syncStop;) {
+    again = false;
+    String stray;
+    if (DIR *dir = opendir((String(kCardMount) + folder).c_str())) {
+      for (const dirent *entry; !syncStop && (entry = readdir(dir));)
+        if (numbered(entry->d_name) && !inManifest(manifest, entry->d_name)) { stray = entry->d_name; break; }
+      closedir(dir);
+    }
+    if (stray.length()) {
+      SD.remove(bin + "/" + stray);
+      if (SD.rename(folder + "/" + stray, bin + "/" + stray)) { moved++; again = true; }
+    }
+  }
+  return moved;
+}
+
 // Reads up to `marker` in the stream; false if it never came.
 bool skipTo(YieldingReader &reader, const char *marker) {
   const size_t length = strlen(marker);
@@ -676,7 +722,7 @@ void syncPass() {
     if (list) list.close();
   }
   syncMissing = missing;
-  if (!missing) { syncState = "UP TO DATE"; return; }
+  if (!missing) { moveRemoved(folder, manifest, total); syncState = "UP TO DATE"; return; }
   syncState = "GETTING";
   File list = SD.open(manifest, FILE_READ);
   size_t offset = 0;
@@ -703,7 +749,7 @@ void syncPass() {
   }
   if (list) list.close();
   if (syncStop) syncState = "PAUSED";
-  else if (!failed && strcmp(syncState, "MORE TO GET")) syncState = "UP TO DATE";
+  else if (!failed && strcmp(syncState, "MORE TO GET")) { moveRemoved(folder, manifest, total); syncState = "UP TO DATE"; }
 }
 
 void syncTask(void *) {

@@ -55,7 +55,8 @@ void forget();
 
 // Card sync: the owner's Navidrome playlist (named after them) mirrored into /music/<Playlist>
 // on the card as "001 Title - Artist.mp3", the names tools/sd-cards/card.py gives. Only what is
-// missing is fetched; a renumbered song is renamed, nothing is deleted. Runs on its own task,
+// missing is fetched; a renumbered song is renamed; a song off the playlist moves to
+// /music/.removed/<Playlist>, hidden, never deleted. Runs on its own task,
 // one song at a time, and stops at once when asked (a media app opening, charging mode).
 void startCardSync();
 void stopCardSync(uint32_t waitMs);
