@@ -63,6 +63,13 @@ constexpr bool kBuildFrenchDefault = false;
 bool frenchUi = kBuildFrenchDefault;
 SharedText<8> languageOverride{"auto"};
 const char *uiText(const char *english, const char *french) { return frenchUi ? french : english; }
+
+// Jay's reading mode (Fn+J, on every Cardputer): large type in chat and the song and book lists, for reading
+// what a child shows without glasses. The keys work as usual. Fn+J again, or 10 minutes, ends it.
+bool readingMode = false;
+uint32_t readingSince = 0;
+constexpr uint32_t kReadingMs = 10 * 60000;
+void setReadingMode(bool on) { readingMode = on; readingSince = millis(); }
 // The library's and the player's failure texts are English; a French device shows these.
 const char *failureText(const char *english) {
   static const char *const kFrench[][2] = {
@@ -2507,6 +2514,9 @@ void drawChat() {
   const int first = std::max(0, end - 10);
   std::vector<ChatLine> lines;
   lines.reserve(10);
+  // Large type (reading mode): 2x Font0, 19 characters a row and 20 px a line; normally 1.5x, 25 and 17.
+  const float chatScale = readingMode ? 2.0f : 1.5f;
+  const int chatRowChars = readingMode ? 18 : 25, chatLineHeight = readingMode ? 20 : 17;
   for (int index = first; index < end; index++) {
     const auto &message = messages[index];
     const bool mine = message.authorId == kDeviceId;
@@ -2516,7 +2526,7 @@ void drawChat() {
     String text = message.voice ? String("[voice message]") : message.body;
     bool firstChunk = true;
     while (!text.isEmpty()) {
-      const int width = firstChunk ? std::max(8, 23 - static_cast<int>(sender.length())) : 25;
+      const int width = firstChunk ? std::max(6, chatRowChars - 2 - static_cast<int>(sender.length())) : chatRowChars;
       int split = text.length() <= width ? text.length() : text.lastIndexOf(' ', width);
       if (split < 6) split = std::min(width, static_cast<int>(text.length()));
       String line = text.substring(0, split);
@@ -2544,26 +2554,26 @@ void drawChat() {
   int firstLine = static_cast<int>(lines.size());
   int usedHeight = 0;
   while (firstLine > 0) {
-    if (usedHeight + 17 > 82) break;
-    usedHeight += 17; firstLine--;
+    if (usedHeight + chatLineHeight > 82) break;
+    usedHeight += chatLineHeight; firstLine--;
   }
   // Never show an orphaned body whose sender prefix was clipped by the viewport.
   if (firstLine < static_cast<int>(lines.size()) && !lines[firstLine].showSender) {
     // That line was wrapped with no room for "Name: " in front of it: cut it to fit after the name.
     ChatLine &line = lines[firstLine];
     line.showSender = true;
-    const int room = std::max(4, 25 - static_cast<int>(utf8CharacterCount(line.sender)) - 2);
+    const int room = std::max(4, chatRowChars - static_cast<int>(utf8CharacterCount(line.sender)) - 2);
     if (static_cast<int>(utf8CharacterCount(line.text)) > room) line.text = utf8Head(line.text, room - 1) + "~";
   }
   int y = 24;
   for (int index = firstLine; index < static_cast<int>(lines.size()); index++) {
     // Font0 stores CP437 bitmaps; map UTF-8 accents to their actual glyph slots.
-    display.setFont(&fonts::Font0); display.setTextSize(1.5f);
+    display.setFont(&fonts::Font0); display.setTextSize(chatScale);
     const String prefix = lines[index].showSender ? lines[index].sender + ": " : "";
     // Our lines leave 12 px at the right for the delivery mark.
     const int x = lines[index].mine ? std::max(3, 225 - display.textWidth(prefix + lines[index].text)) : 3;
     const uint32_t lineBackground = lines[index].selected ? 0x18C3 : TFT_BLACK;
-    if (lines[index].selected) display.fillRoundRect(std::max(1, x - 2), y - 2, std::min(238 - x, display.textWidth(prefix + lines[index].text) + 5), 15, 2, lineBackground);
+    if (lines[index].selected) display.fillRoundRect(std::max(1, x - 2), y - 2, std::min(238 - x, display.textWidth(prefix + lines[index].text) + 5), chatLineHeight - 2, 2, lineBackground);
     display.setCursor(x, y);
     if (lines[index].showSender) {
       display.setTextColor(lines[index].colour, lineBackground); printFont0Text(lines[index].sender);
@@ -2572,7 +2582,7 @@ void drawChat() {
     if (lines[index].notice) display.setTextColor(TFT_CYAN, lineBackground);
     printChatText(lines[index].text);
     drawMessageMark(lines[index].mark, y);
-    y += 17;
+    y += chatLineHeight;
   }
   xSemaphoreGive(stateMutex);
   display.setFont(&fonts::Font0);
@@ -2952,36 +2962,43 @@ void drawLibrary() {
   } else if (libraryItems.empty()) {
     display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(12, 50); display.print(uiText("NOTHING HERE", "RIEN ICI"));
   }
-  constexpr int kRows = 7;
+  // Large type (reading mode): 2x, 4 rows of 17 characters; normally 7 rows of 35-37.
+  const int kRows = readingMode ? 4 : 7, rowHeight = readingMode ? 21 : 14;
+  const int rowChars = readingMode ? 17 : kCheckRowChars;
   const int first = constrain(librarySelection - kRows / 2, 0, std::max(0, static_cast<int>(libraryItems.size()) - kRows));
   if (status != library::Status::Loading && status != library::Status::Failed) {
     for (int row = 0; row < kRows && first + row < static_cast<int>(libraryItems.size()); row++) {
-      const auto &item = libraryItems[first + row]; const int y = 22 + row * 14; const bool selected = first + row == librarySelection;
-      display.fillRoundRect(3, y, 234, 13, 3, selected ? TFT_GREEN : TFT_BLACK);
+      const auto &item = libraryItems[first + row]; const int y = 22 + row * rowHeight; const bool selected = first + row == librarySelection;
+      display.fillRoundRect(3, y, 234, rowHeight - 1, 3, selected ? TFT_GREEN : TFT_BLACK);
+      display.setTextSize(readingMode ? 2 : 1);
+      const int textY = y + (readingMode ? 3 : 3);
       if (checkableList()) {
         // Songs with lyrics in cyan; a check in the right-hand gutter for the songs on the play list; the selected
         // name, when too long for its row, scrolls right to left (a pause at each end).
         display.setTextColor(selected ? TFT_BLACK : item.lyrics ? TFT_CYAN : TFT_WHITE, selected ? TFT_GREEN : TFT_BLACK);
-        display.setCursor(7, y + 3);
+        display.setCursor(7, textY);
         const int length = static_cast<int>(utf8CharacterCount(item.title));
         int from = 0;
-        if (selected && length > kCheckRowChars) {
-          const int travel = length - kCheckRowChars, step = static_cast<int>((millis() - librarySelectedAt) / 250) % (travel + 16);
+        if (selected && length > rowChars) {
+          const int travel = length - rowChars, step = static_cast<int>((millis() - librarySelectedAt) / 250) % (travel + 16);
           from = constrain(step - 8, 0, travel);
         }
-        printFont0Text(utf8Head(utf8From(item.title, from), kCheckRowChars));
+        printFont0Text(utf8Head(utf8From(item.title, from), rowChars));
         if (item.checked) {
           const uint16_t ink = selected ? TFT_BLACK : TFT_GREEN;
-          for (int thick = 0; thick < 2; thick++) { display.drawLine(225, y + 6 + thick, 228, y + 9 + thick, ink); display.drawLine(228, y + 9 + thick, 233, y + 2 + thick, ink); }
+          const int my = y + (rowHeight - 13) / 2;
+          for (int thick = 0; thick < 2; thick++) { display.drawLine(225, my + 6 + thick, 228, my + 9 + thick, ink); display.drawLine(228, my + 9 + thick, 233, my + 2 + thick, ink); }
         }
         continue;
       }
-      display.setTextColor(selected ? TFT_BLACK : TFT_WHITE, selected ? TFT_GREEN : TFT_BLACK); display.setCursor(7, y + 3);
-      printFont0Text(utf8Head(item.title, item.resumeMs || item.liked ? 34 : 37));
-      if (item.resumeMs) { display.setCursor(222, y + 3); display.print(">"); }
-      else if (item.liked) { display.setCursor(222, y + 3); display.print("*"); }
+      display.setTextColor(selected ? TFT_BLACK : TFT_WHITE, selected ? TFT_GREEN : TFT_BLACK); display.setCursor(7, textY);
+      printFont0Text(utf8Head(item.title, readingMode ? (item.resumeMs || item.liked ? 16 : 18) : (item.resumeMs || item.liked ? 34 : 37)));
+      if (item.resumeMs) { display.setCursor(readingMode ? 222 : 222, textY); display.print(">"); }
+      else if (item.liked) { display.setCursor(222, textY); display.print("*"); }
+      display.setTextSize(1);
     }
   }
+  display.setTextSize(1);
   display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 123);
   if (checkableList()) display.print(uiText("RIGHT ADD  LEFT REMOVE  G0 BACK", "DROITE AJOUTE GAUCHE ENLEVE G0 RETOUR"));
   else display.print(libraryView == LibraryView::Albums ? uiText("LEFT/RIGHT PAGE  ENTER OPEN", "GAUCHE/DROITE PAGE ENTER") : uiText("UP/DOWN MOVE      ENTER OPEN", "HAUT/BAS BOUGER   ENTER OUVRIR"));
@@ -5009,6 +5026,9 @@ void handleKeyboard() {
   if (ringingNow() != Ringing::None) { if (clockapps::reached(millis(), ringKeysFrom)) dismissRinging(keys.enter); return; }
   // The first key only brings back the screen under the big clock.
   if (idleClockShown) { setIdleClock(false); return; }
+  bool jPressed = physicalKeyAt(8, 2);
+  for (const auto character : keys.word) jPressed |= character == 'j' || character == 'J';
+  if (keys.fn && jPressed) { setReadingMode(!readingMode); playNextTone(); renderDirty = true; return; }
   if (screenMode == ScreenMode::Charging && chargingDimmed) {
     chargingDimmed = false;
     M5Cardputer.Display.setBrightness(kChargeBrightness);
@@ -5279,8 +5299,9 @@ static void loopBody() {
   if (screenMode == ScreenMode::Chat && chatNoticeAt && millis() - chatNoticeAt > 6000) { chatNoticeAt = 0; renderDirty = true; }
   serviceNearbySends();
   if (screenMode == ScreenMode::System && millis() - lastRenderAt >= 1000) renderDirty = true;
+  if (readingMode && millis() - readingSince >= kReadingMs) { setReadingMode(false); renderDirty = true; }
   if (checkableList() && librarySelection < static_cast<int>(libraryItems.size()) && millis() - lastRenderAt >= 250 &&
-      utf8CharacterCount(libraryItems[librarySelection].title) > kCheckRowChars) renderDirty = true;
+      utf8CharacterCount(libraryItems[librarySelection].title) > (readingMode ? 17 : kCheckRowChars)) renderDirty = true;
   if (renderDirty && millis() - lastRenderAt >= kRenderIntervalMs) render();
   delay(2);
 }
