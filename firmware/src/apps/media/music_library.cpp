@@ -95,11 +95,12 @@ bool serverKnownDown() { return serverWasDown && millis() - serverDownAt < kServ
 // and on a slow server that starves core 0's idle task until the watchdog restarts the device.
 struct YieldingReader {
   WiFiClient &client;
+  os::Pacer pacer;  // A big reply from a fast server never waits below: os.h's rule.
   int read() {
     const uint32_t started = millis();
     while (millis() - started < kTimeoutMs) {
       const int value = client.read();
-      if (value >= 0) return value;
+      if (value >= 0) { pacer.step(); return value; }
       if (!client.connected()) return -1;
       vTaskDelay(pdMS_TO_TICKS(2));
     }
@@ -743,6 +744,7 @@ bool download(const String &id, const String &folder, const String &name) {
   uint8_t buffer[1536];  // On the task's stack: no RAM held between passes.
   int written = 0;
   uint32_t lastData = millis();
+  os::Pacer pacer;
   bool ok = true;
   while (!syncStop && (length < 0 || written < length)) {
     const int available = client.available();
@@ -756,10 +758,7 @@ bool download(const String &id, const String &folder, const String &name) {
     if (got <= 0) continue;
     if (out.write(buffer, got) != static_cast<size_t>(got)) { ok = false; syncState = "CARD FULL"; break; }
     written += got; lastData = millis();
-    // A tick back to the core after every chunk: with data always waiting (a fast network) the loop never
-    // reached the delay above, starved core 0's idle task, and the watchdog restarted the device after
-    // 5 s (runtime emulator card-sync through a local server, 2026-11-22). Costs at most 1 ms a chunk.
-    vTaskDelay(1);
+    pacer.step();  // os.h: with data always waiting, this loop starved core 0 and tripped the watchdog.
   }
   out.close();
   http.end();

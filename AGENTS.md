@@ -36,6 +36,12 @@ Kidputer: one firmware of apps for pre-phone-age kids on the Cardputer ADV (Supa
   Run `make check` there before promoting anything to a device; the upload gate runs it when it is present.
 - `firmware/include/os.h` is the layer keeping apps within their RAM: budgets, one secure connection
   at a time, containment, the boot phase. `docs/heap-budget.md` has the measurements behind it.
+- **CPU time is shared like RAM.** Each core's idle task must run every 5 s or the watchdog restarts
+  the device. A loop that waits only when it has nothing to do never waits once data keeps coming (a
+  fast network, a big file), so every loop that can run long steps an `os::Pacer` (a tick back every
+  20 ms of work, whatever is waiting). Test network code against a fast local server too, not only a
+  slow link: the card sync's download loop restarted the device on a fast network, and every slow-link
+  run had hidden it (2026-11-22; `cardputer-emulator/tools/navidrome-proxy.py` found it).
 
 ## Investigating a device report
 

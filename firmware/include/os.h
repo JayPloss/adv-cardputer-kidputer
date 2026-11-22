@@ -72,6 +72,21 @@ uint32_t lastFaultAt();
 uint32_t faultCount();
 bool takeFaultNotice(char *text, size_t size);
 
+// CPU time is shared like RAM. Each core's idle task must run at least every 5 s or the task watchdog
+// restarts the device; a loop that waits only when it has nothing to do never waits once data is always
+// there (a fast network, a full buffer, a big file), and starves it. Every loop that can run long steps a
+// Pacer: a tick back to the core every kPaceMs of work, whatever is waiting. (2026-11-22: the card sync's
+// download loop restarted the device on a fast network; slow links had always given it gaps.)
+constexpr uint32_t kPaceMs = 20;
+struct Pacer {
+  uint32_t since = millis();
+  void step() {
+    if (millis() - since < kPaceMs) return;
+    vTaskDelay(1);
+    since = millis();
+  }
+};
+
 // The boot phase: the splash stays until chat's first sync settles or can't proceed.
 enum class Boot : uint8_t { Joining, Syncing, Ready, NoNetwork, ServerDown, TimedOut, Skipped };
 constexpr uint32_t kBootMaxMs = 45000;
