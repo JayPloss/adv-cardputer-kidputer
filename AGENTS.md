@@ -27,16 +27,9 @@ Kidputer: one firmware of apps for pre-phone-age kids on the Cardputer ADV (Supa
   it is stuck, the owner presses reset or unplugs it. (Origin 2026-11-07: a read-only log check
   knocked Papa's device offline during a delivery diagnosis.)
 
-## Off Wi-Fi is normal
+## Design principles
 
-- The devices work without Wi-Fi; Wi-Fi is only for moving data between distant places (chat, sync).
-  Clock, alarms, timers, screen time and parent quiet times work from the device alone, from cached state.
-  Nothing in an enforcement path waits on the server, and "server unreachable" never means "no limits".
-- Chat, reports and receipts queue in persistent storage and send when a network appears; never dropped.
-  Whatever needs the network says so in one line on screen while the rest keeps working.
-- Not aggressive: a wrong or unknown clock must never stop a kid playing music on a car trip. Predictable
-  beats unbreakable. Clock-trust tiers and thresholds: `docs/PARENT-CONTROLS.md`.
-- (Jay, 2026-11-22.)
+- Read README.md's "Design principles" before changing what the device does; they apply to every app.
 
 ## Emulators
 

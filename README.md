@@ -3,6 +3,18 @@
 A multi-function pal for kids too young for a phone, on M5Stack Cardputer ADV handhelds. One firmware holds every app;
 `firmware/include/os.h` keeps them inside the device's RAM (budgets, one secure connection at a time).
 
+## Design principles
+
+- **Off Wi-Fi is normal.** The devices work without Wi-Fi; Wi-Fi is only for moving data between distant
+  places (chat, sync). Clock, alarms, timers, screen time and parent quiet times work from the device
+  alone, from cached state. Nothing in an enforcement path waits on the server, and "server unreachable"
+  never means "no limits".
+- Chat, reports and receipts queue in persistent storage and send when a network appears; never dropped.
+  Whatever needs the network says so in one line on screen while the rest keeps working.
+- **Not aggressive.** A wrong or unknown clock must never stop a kid playing music on a car trip.
+  Predictable beats unbreakable. Clock-trust tiers and thresholds: `docs/PARENT-CONTROLS.md`.
+- (Jay, 2026-11-22.)
+
 ## Apps and functions
 
 | App (HOME label) | What it does | Code |
