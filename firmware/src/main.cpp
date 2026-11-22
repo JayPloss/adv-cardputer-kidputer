@@ -84,7 +84,9 @@ bool lyricsWanted = false;
 enum class Repeat : uint8_t { Off, All, One };
 Repeat repeatMode = Repeat::Off;
 bool shuffleOn = false;
-bool wrapRequested = false;  // repeat-all asked the card for its first song once: no loop on an empty folder
+bool wrapRequested = false;
+// D DELETE / E EFFACER on a song from the card asks first; Enter confirms (playerKeys).
+bool deleteAsked = false;  // repeat-all asked the card for its first song once: no loop on an empty folder
 constexpr size_t kMessageLimit = 140;
 constexpr size_t kHistoryLimit = 100;  // What the first sync fetches; older pages go to the card.
 constexpr size_t kRamMessageLimit = 40;
@@ -2436,6 +2438,7 @@ void drawWarningBanner() {
 
 size_t utf8CharacterCount(const String &text);
 String utf8Tail(const String &text, size_t maximumCharacters);
+String utf8Head(const String &text, size_t maximumCharacters);
 void printFont0Text(const String &text);
 void printChatText(const String &text);
 void drawEmoji(int kind, int x, int y, uint32_t background);
@@ -2522,7 +2525,13 @@ void drawChat() {
     usedHeight += 17; firstLine--;
   }
   // Never show an orphaned body whose sender prefix was clipped by the viewport.
-  if (firstLine < static_cast<int>(lines.size())) lines[firstLine].showSender = true;
+  if (firstLine < static_cast<int>(lines.size()) && !lines[firstLine].showSender) {
+    // That line was wrapped with no room for "Name: " in front of it: cut it to fit after the name.
+    ChatLine &line = lines[firstLine];
+    line.showSender = true;
+    const int room = std::max(4, 25 - static_cast<int>(utf8CharacterCount(line.sender)) - 2);
+    if (static_cast<int>(utf8CharacterCount(line.text)) > room) line.text = utf8Head(line.text, room - 1) + "~";
+  }
   int y = 24;
   for (int index = firstLine; index < static_cast<int>(lines.size()); index++) {
     // Font0 stores CP437 bitmaps; map UTF-8 accents to their actual glyph slots.
@@ -3046,9 +3055,16 @@ void drawNowPlaying() {
   // The music player's first hint line takes turns, 3 s each, with the modes' keys: both don't fit.
   const bool modesHint = queueCollection == library::Collection::Music && millis() / 3000 % 2 == 1;
   if (lyricsShown) display.print(uiText("LEFT/RIGHT SONG", "GAUCHE/DROITE"));
-  else if (modesHint) display.print(uiText("M MIX   R REPEAT", "M MELANGER   R REPETER"));
+  else if (modesHint) display.print(uiText("M MIX  R REPEAT  D DELETE", "M MELANGER  R REPETER  E EFFACER"));
   else if (lyricsHere) display.print(uiText("LEFT/RIGHT SONG UP/DOWN VOL L LYRICS", "GAUCHE/DROITE HAUT/BAS VOL P PAROLES"));
   else display.print(queueCollection == library::Collection::Books ? uiText("LEFT/RIGHT 30s    UP/DOWN VOL", "GAUCHE/DROITE 30s HAUT/BAS VOL") : uiText("LEFT/RIGHT SONG   UP/DOWN VOL", "GAUCHE/DROITE     HAUT/BAS VOL"));
+  if (deleteAsked) {
+    display.fillRect(0, 106, 240, 29, TFT_RED);
+    display.setTextColor(TFT_WHITE, TFT_RED);
+    display.setCursor(6, 110); display.print(uiText("DELETE THIS SONG FROM THE CARD?", "EFFACER CETTE CHANSON DE LA CARTE?"));
+    display.setCursor(6, 123); display.print(uiText("ENTER YES    OTHER KEY NO", "ENTER OUI    AUTRE TOUCHE NON"));
+    return;
+  }
   display.setCursor(6, 123);
   if (lyricsShown) display.print(uiText("ENTER PAUSE  L LYRICS  S STOP", "ENTER PAUSE  P PAROLES  S STOP"));
   else display.print(queueCollection == library::Collection::Books ? uiText("ENTER PAUSE  T TIMER  S STOP", "ENTER PAUSE  T MINUTERIE  S STOP") : uiText("ENTER PAUSE F FAVOURITE T TIMER S STOP", "ENTER PAUSE A AIME T MINUTERIE S STOP"));
@@ -4794,6 +4810,20 @@ bool handleAppKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown
     playNextTone(); renderDirty = true; return true;
   }
   // Now playing. Music keeps going after leaving this screen; S stops it.
+  // Delete asked: Enter confirms, any other key cancels.
+  if (deleteAsked) {
+    deleteAsked = false;
+    const auto *item = nowPlayingItem();
+    if (keys.enter && item && item->onCard) {
+      const String title = item->title;
+      stopMediaNow();
+      library::deleteTrack(queueFolder, title);
+      Serial.printf("PLAYER deleted %s\n", title.c_str());
+      queueEnded = false;
+      nextMusicSong();
+    }
+    playNextTone(); renderDirty = true; return true;
+  }
   if (keys.enter) {
     const bool resuming = media::state() == media::State::Paused;
     media::togglePause();
@@ -4816,6 +4846,7 @@ bool handleAppKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown
         M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
       }
       // Each key is the first letter of the word its hint shows: L LYRICS / P PAROLES, F FAVOURITE / A AIME.
+      else if (tolower(character) == (frenchUi ? 'e' : 'd') && queueCollection == library::Collection::Music && queueIndex >= 0 && playQueue[queueIndex].onCard) deleteAsked = true;
       else if (tolower(character) == 'm' && queueCollection == library::Collection::Music) { shuffleOn = !shuffleOn; savePlayModes(); }
       else if (tolower(character) == 'r' && queueCollection == library::Collection::Music) {
         repeatMode = repeatMode == Repeat::Off ? Repeat::All : repeatMode == Repeat::All ? Repeat::One : Repeat::Off;

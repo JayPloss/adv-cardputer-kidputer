@@ -43,7 +43,7 @@ constexpr uint32_t kConnectTimeoutMs = 2000;
 constexpr uint32_t kServerRetryMs = 60000;
 constexpr size_t kCardTrackLimit = 300;
 
-enum class JobKind : uint8_t { CardAlbums, CardTracks, Adjacent, SavePlace, ClearPlace, Albums, Liked, Search, Tracks, SaveBookmark, DeleteBookmark, Like, Unlike };
+enum class JobKind : uint8_t { CardAlbums, CardTracks, Adjacent, SavePlace, ClearPlace, Albums, Liked, Search, Tracks, SaveBookmark, DeleteBookmark, Like, Unlike, DeleteTrack };
 struct Job { JobKind kind; String text; int number; Collection collection; String extra; uint32_t generation; };
 
 SemaphoreHandle_t mutex = nullptr;
@@ -325,6 +325,38 @@ bool runCardTracks(const Job &job) {
   return true;
 }
 
+// Songs deleted on the device: "<folder>/.deleted.txt", one name a line without its "NNN " number. The song moves
+// to /music/.removed/<folder> with its lyrics (recoverable), and card sync never fetches it again.
+String songTail(const String &name) {
+  String tail = name;
+  if (tail.endsWith(".mp3")) tail.remove(tail.length() - 4);
+  if (tail.length() > 4 && isdigit(tail[0]) && isdigit(tail[1]) && isdigit(tail[2]) && tail[3] == ' ') tail.remove(0, 4);
+  return tail;
+}
+
+bool deletedOnDevice(const String &folder, const String &name) {
+  File list = SD.open(folder + "/.deleted.txt", FILE_READ);
+  if (!list) return false;
+  const String tail = songTail(name);
+  bool found = false;
+  while (list.available() && !found) { String line = list.readStringUntil('\n'); line.trim(); found = line == tail; }
+  list.close();
+  return found;
+}
+
+void deleteCardTrack(const String &folder, const String &title) {
+  const String bin = "/music/.removed/" + folder.substring(folder.lastIndexOf('/') + 1);
+  if (!SD.exists("/music/.removed")) SD.mkdir("/music/.removed");
+  if (!SD.exists(bin)) SD.mkdir(bin);
+  for (const char *kind : {".mp3", ".lrc", ".nolrc"}) {
+    const String from = folder + "/" + title + kind;
+    if (!SD.exists(from)) continue;
+    SD.remove(bin + "/" + title + kind);
+    SD.rename(from, bin + "/" + title + kind);
+  }
+  if (File list = SD.open(folder + "/.deleted.txt", FILE_APPEND)) { list.println(songTail(title)); list.close(); }
+}
+
 // A random song of the folder other than the one playing, for shuffle: counted on one pass, then the
 // chosen one found on a second, so the folder is never listed into RAM.
 void runRandom(const Job &job) {
@@ -514,6 +546,7 @@ void workerTask(void *) {
       case JobKind::Adjacent: runAdjacent(job); break;
       case JobKind::SavePlace: writeCardPlace(job); break;
       case JobKind::ClearPlace: SD.remove(placePath(job.text)); SD.remove(placePath(job.text) + ".new"); break;
+      case JobKind::DeleteTrack: deleteCardTrack(job.text, job.extra); break;
       case JobKind::Albums: ok = runAlbums(job); break;
       case JobKind::Liked: ok = runLiked(); break;
       case JobKind::Search: ok = runSearch(job); break;
@@ -592,41 +625,44 @@ bool numbered(const char *name) {
   return strlen(name) > 8 && isdigit(name[0]) && isdigit(name[1]) && isdigit(name[2]) && name[3] == ' ' && isMp3(name);
 }
 
-bool inManifest(const String &manifest, const char *name) {
-  File list = SD.open(manifest, FILE_READ);
-  bool found = false;
-  while (list && list.available() && !found) {
-    const String line = list.readStringUntil('\n');
-    const int tab = line.indexOf('\t');
-    found = tab > 0 && !strcmp(line.c_str() + tab + 1, name);
-  }
-  if (list) list.close();
-  return found;
-}
 
 // Songs taken off the playlist leave the kid's folder: moved, not deleted, to /music/.removed/<Playlist>
 // (hidden from the player), so one put back on the list comes back without a download. Only numbered
-// songs ("001 ..."), the sync's own names, are moved; anything else in the folder stays.
+// songs ("001 ..."), the sync's own names, are moved; anything else in the folder stays. The playlist's
+// names are held as 32-bit hashes (4 bytes a song), so every file is checked without rereading the list.
+// (A count shortcut used to skip this when the folder held no more songs than the list: one song deleted
+// on the device then hid one stray. Emulator card-sync, 2026-11-22.)
+uint32_t nameHash(const char *name) {
+  uint32_t hash = 2166136261u;
+  for (const char *c = name; *c; c++) hash = (hash ^ static_cast<uint8_t>(*c)) * 16777619u;
+  return hash;
+}
+
 int moveRemoved(const String &folder, const String &manifest, int total) {
-  int songs = 0;
-  if (DIR *dir = opendir((String(kCardMount) + folder).c_str())) {
-    for (const dirent *entry; (entry = readdir(dir));) songs += numbered(entry->d_name);
-    closedir(dir);
+  std::vector<uint32_t> listed;
+  listed.reserve(total + 1);
+  if (File list = SD.open(manifest, FILE_READ)) {
+    while (list.available()) {
+      const String line = list.readStringUntil('\n');
+      const int tab = line.indexOf('\t');
+      if (tab > 0) listed.push_back(nameHash(line.c_str() + tab + 1));
+    }
+    list.close();
   }
-  if (songs <= total) return 0;  // Nothing extra: no need to read the list against every file.
+  std::sort(listed.begin(), listed.end());
   const String bin = "/music/.removed/" + folder.substring(folder.lastIndexOf('/') + 1);
-  if (!SD.exists("/music/.removed")) SD.mkdir("/music/.removed");
-  if (!SD.exists(bin)) SD.mkdir(bin);
   int moved = 0;
   for (bool again = true; again && !syncStop;) {
     again = false;
     String stray;
     if (DIR *dir = opendir((String(kCardMount) + folder).c_str())) {
       for (const dirent *entry; !syncStop && (entry = readdir(dir));)
-        if (numbered(entry->d_name) && !inManifest(manifest, entry->d_name)) { stray = entry->d_name; break; }
+        if (numbered(entry->d_name) && !std::binary_search(listed.begin(), listed.end(), nameHash(entry->d_name))) { stray = entry->d_name; break; }
       closedir(dir);
     }
     if (stray.length()) {
+      if (!SD.exists("/music/.removed")) SD.mkdir("/music/.removed");
+      if (!SD.exists(bin)) SD.mkdir(bin);
       SD.remove(bin + "/" + stray);
       if (SD.rename(folder + "/" + stray, bin + "/" + stray)) {
         moved++; again = true;
@@ -829,7 +865,7 @@ void syncPlaylist(const String &playlistId, const String &playlistName, bool rin
     while (list && list.available() && !syncStop) {
       String line = list.readStringUntil('\n');
       const int tab = line.indexOf('\t');
-      if (tab > 0 && !onCard(folder + "/" + line.substring(tab + 1))) missing++;
+      if (tab > 0 && !onCard(folder + "/" + line.substring(tab + 1)) && !deletedOnDevice(folder, line.substring(tab + 1))) missing++;
     }
     if (list) list.close();
   }
@@ -852,7 +888,7 @@ void syncPlaylist(const String &playlistId, const String &playlistName, bool rin
     const int tab = line.indexOf('\t');
     if (tab <= 0) continue;
     const String id = line.substring(0, tab), name = line.substring(tab + 1);
-    if (onCard(folder + "/" + name)) continue;
+    if (onCard(folder + "/" + name) || deletedOnDevice(folder, name)) continue;
     if (syncDone >= cap) { syncState = "MORE TO GET"; break; }
     // The card file stays closed while a song downloads: two open files is RAM the player may want.
     list.close();
@@ -967,6 +1003,7 @@ void requestCardAlbums(Collection collection) { enqueue({JobKind::CardAlbums, ""
 void requestCardTracks(const String &folder) { enqueue({JobKind::CardTracks, folder, 0, Collection::Books}, true); }
 void saveCardPlace(const String &folder, const String &trackPath, uint32_t seconds) { enqueue({JobKind::SavePlace, folder, static_cast<int>(seconds), Collection::Books, trackPath}, false); }
 void clearCardPlace(const String &folder) { enqueue({JobKind::ClearPlace, folder, 0, Collection::Books}, false); }
+void deleteTrack(const String &folder, const String &title) { enqueue({JobKind::DeleteTrack, folder, 0, Collection::Music, title}, false); }
 void requestAdjacentTrack(const String &folder, const String &title, int direction) { enqueue({JobKind::Adjacent, folder, direction, Collection::Books, title}, false); }
 bool takeAdjacentTrack(Item &item, bool &found) {
   if (!mutex) return false;

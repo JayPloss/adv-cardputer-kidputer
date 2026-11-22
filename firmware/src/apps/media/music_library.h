@@ -38,6 +38,8 @@ void requestCardTracks(const String &folder);
 // Where a book on the card was left; each book folder keeps one place.
 void saveCardPlace(const String &folder, const String &trackPath, uint32_t seconds);
 void clearCardPlace(const String &folder);
+// A song deleted on the device: off the card (to /music/.removed, recoverable) and never synced back.
+void deleteTrack(const String &folder, const String &title);
 // The chapter after (or before) one on the card, found without listing the folder into RAM.
 void requestAdjacentTrack(const String &folder, const String &title, int direction);
 // direction kRandomTrack: any other song of the folder (shuffle); 1 with an empty title: the first song.
