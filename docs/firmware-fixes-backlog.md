@@ -33,6 +33,8 @@ button. Verify on a physical Cardputer with both a tap and a long hold.
 boot splash and across charging-mode entry/exit. The deterministic printable-key
 case passes; physical keyboard and rear-button acceptance remains outstanding.
 
+**v0.61 status:** No report since v0.49; the runtime emulator's `boot-skip` scenario (key held across the splash) passes.
+
 ## 2. Papa needs a custom boot logo
 
 **Report:** Papa's Cardputer should have a custom logo.
@@ -82,6 +84,10 @@ room switch away/back, duplicate idempotent sync payloads, and a genuinely new
 post-hydration message. Then collect physical runtime evidence on Julien and a
 second known device. Do not call the defect fixed from the current source guard
 alone.
+
+**v0.61 status:** Does not reproduce in the runtime emulator: `notify-reboot` boots, gets a new
+message (3 notification tones), restarts with that history on the card, and the restart plays only
+the startup melody, as many tones as a first boot. No device evidence since v0.43.
 
 ## Attached Papa device
 
