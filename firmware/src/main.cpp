@@ -772,6 +772,20 @@ void drawBootStatus(os::Boot phase) {
   display.fillRect(60, 125, 180, 10, TFT_BLACK); display.setCursor(64, 125); display.print(os::bootText(phase));
 }
 
+// After the start: "PRESS A KEY" under the result, then the first key (or G0) goes on and does nothing else.
+void awaitBootKey() {
+  auto &display = M5Cardputer.Display;
+  display.setFont(&fonts::Font0); display.setTextSize(1); display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.fillRect(60, 115, 180, 10, TFT_BLACK); display.setCursor(64, 115); display.print(uiText("PRESS A KEY", "APPUIE UNE TOUCHE"));
+  for (;;) {
+    M5Cardputer.update();
+    if (M5Cardputer.Keyboard.isPressed() || M5Cardputer.BtnA.isPressed()) break;
+    delay(10);
+  }
+  // The key that went on is let go before the apps see keys, so it doesn't also act on HOME.
+  while (M5Cardputer.Keyboard.isPressed() || M5Cardputer.BtnA.isPressed()) { M5Cardputer.update(); delay(10); }
+}
+
 void showBootSplash() {
   M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
   size_t step = 0;
@@ -781,8 +795,15 @@ void showBootSplash() {
   for (;;) {
     // Control comes when chat's first sync has settled, or when it can't proceed.
     if (os::boot() != shownPhase) { shownPhase = os::boot(); drawBootStatus(shownPhase); }
-    if (os::bootSettled()) { M5Cardputer.Speaker.stop(); return; }
-    if (millis() - bootStarted >= os::kBootMaxMs) { os::setBoot(os::Boot::TimedOut); M5Cardputer.Speaker.stop(); return; }
+    // Done (READY, or the step it stopped at): the splash stays, saying so, until a key (Jay, 2026-11-22: it
+    // used to leave on its own, so nobody saw how the start went).
+    if (os::bootSettled() || millis() - bootStarted >= os::kBootMaxMs) {
+      if (!os::bootSettled()) os::setBoot(os::Boot::TimedOut);
+      M5Cardputer.Speaker.stop();
+      drawBootStatus(os::boot());
+      awaitBootKey();
+      return;
+    }
     const size_t noteIndex = step % kBootTuneLength;
     if (kBootTuneFrequencies[noteIndex] > 0) {
       M5Cardputer.Speaker.tone(kBootTuneFrequencies[noteIndex], kBootTuneNoteMs, 0, true);
