@@ -1588,8 +1588,9 @@ bool connectKnownWifi() {
   const uint32_t started = millis();
   while (!chargingModeActive && WiFi.status() != WL_CONNECTED && millis() - started < 12000) vTaskDelay(pdMS_TO_TICKS(100));
   if (chargingModeActive) { WiFi.disconnect(false, false); return false; }
-  if (WiFi.status() != WL_CONNECTED) { WiFi.disconnect(false, false); networkStatus = "JOIN FAILED"; return false; }
+  if (WiFi.status() != WL_CONNECTED) { Serial.printf("WIFI join %s failed status=%d\n", joinSsid.c_str(), WiFi.status()); WiFi.disconnect(false, false); networkStatus = "JOIN FAILED"; return false; }
   currentSsid = WiFi.SSID(); networkStatus = "ONLINE"; renderDirty = true;
+  Serial.printf("WIFI joined %s channel %d rssi %d free %u largest %u\n", joinSsid.c_str(), WiFi.channel(), WiFi.RSSI(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   return true;
 }
 
@@ -2352,6 +2353,13 @@ void networkTask(void *) {
     if (mediaOwnsRadio() || os::secureHeld() || !os::secureFits()) {
       if (!os::bootSettled() && !os::secureFits()) os::setBoot(os::Boot::ServerDown);
       if (!mediaOwnsRadio() && !os::secureHeld()) networkStatus = "CHAT WAITS";
+      // Why chat can't reach the server, every 10 s on USB: the RAM picture (free, largest block, each app's use).
+      static uint32_t lastWaitLogAt = 0;
+      if (millis() - lastWaitLogAt >= 10000) {
+        lastWaitLogAt = millis();
+        char picture[400]; os::snapshot(picture, sizeof picture);
+        Serial.printf("CHAT WAITS media=%d held=%d fits=%d %s\n", mediaOwnsRadio(), os::secureHeld(), os::secureFits(), picture);
+      }
       renderDirty = true; vTaskDelay(pdMS_TO_TICKS(500)); continue;
     }
     const bool hadSynced = initialSyncComplete;
