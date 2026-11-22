@@ -20,6 +20,10 @@ Run on paqman. Data (Spotify pages, matches, file map) lives in `~/.local/share/
    missing, at most 4 songs a pass (passes 2 minutes apart, then every 30 minutes), renaming a renumbered
    song, deleting nothing. Files keep Navidrome's ID3 tag: the v0.59 player reads past it. STATUS shows
    the state on its MUSIC line. So after step 4, a new song reaches the cards on home Wi-Fi with no card in the reader.
+7. Lyrics: `uv run --with mutagen python -I lyrics.py` puts each song's lyrics in `<data>/lyrics/<file stem>.lrc`
+   (LRCLIB's line times) or `.txt` (plain): LRCLIB first, `OTHER` for songs it files under another name or
+   whose words come from the original (covers), Suno songs from their own tag, lyrics.ovh last. 2026-11-21:
+   112 timed, 25 plain, 2 with none anywhere (Traverser les saisons, La Choucroute). `--report` counts.
 6. `pkexec label-card CRD-DREW|CRD-EMMA|CRD-NAO` unmounts the card and sets its volume label; it refuses
    unless the matching `CARTE-<KID>.txt` is on the card. Root, so it opens the polkit dialog.
 
