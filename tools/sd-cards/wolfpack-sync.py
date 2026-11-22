@@ -7,7 +7,7 @@ A systemd user timer runs it every 6 hours (wolfpack-sync.timer, next to this fi
 2. resolve.py: playlists.json in Spotify's order, hand-added songs kept at the end; a YouTube Music
    match for each new song only.
 3. rip.py: new songs into ~/Music/wolfpack; a weak match waits in DATA/needs-a-look.txt.
-4. lyrics.py: lyrics for the new songs.
+4. lyrics.py: lyrics for the new songs, copied beside each song as Navidrome's sidecar (.lrc timed, else .txt).
 5. When anything changed: rsync to ori-san's library, a Navidrome scan, and each kid's playlist made
    again in the new order (navidrome-playlists.py). Each Cardputer then fetches what it lacks on home
    Wi-Fi (firmware v0.61 card sync).
@@ -37,7 +37,8 @@ def step(name, command, **kw):
 
 def fingerprint():
     state = {"lists": json.loads((DATA / "playlists.json").read_text())["lists"],
-             "files": sorted(p.name for p in MUSIC.glob("*.mp3"))}
+             "files": sorted(p.name for p in MUSIC.glob("*.mp3")),
+             "lyrics": sorted(hashlib.sha256(p.read_bytes()).hexdigest() for p in list(MUSIC.glob("*.lrc")) + list(MUSIC.glob("*.txt")))}
     return hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
 
 
@@ -69,10 +70,25 @@ def main():
     step("rip new songs", ["uv", "run", "-q", "--with", "yt-dlp[default]", "--with", "yt-dlp-ejs", "--with", "mutagen", "python", "-I", "rip.py"])
     look = (DATA / "needs-a-look.txt").read_text().strip() if (DATA / "needs-a-look.txt").exists() else ""
     step("lyrics", ["uv", "run", "-q", "--with", "mutagen", "python", "-I", "lyrics.py"])
+    # Each song's lyrics beside it, as Navidrome's sidecar (same name, .lrc or .txt): it serves them through
+    # getLyricsBySongId, and the Cardputers fetch them from there. A timed file from the timing pass
+    # (lyrics/timed/) wins over LRCLIB's.
+    print("[wolfpack-sync] lyrics beside the songs", flush=True)
+    for source in sorted((DATA / "lyrics").glob("*.lrc")) + sorted((DATA / "lyrics").glob("*.txt")):
+        timed = DATA / "lyrics" / "timed" / f"{source.stem}.lrc"
+        song = MUSIC / f"{source.stem}.mp3"
+        if not song.exists():
+            continue
+        if source.suffix == ".txt" and ((DATA / "lyrics" / f"{source.stem}.lrc").exists() or timed.exists()):
+            continue
+        chosen = timed if timed.exists() else source
+        target = MUSIC / f"{source.stem}{chosen.suffix}"
+        if not target.exists() or target.read_bytes() != chosen.read_bytes():
+            target.write_bytes(chosen.read_bytes())
     if fingerprint() == before and "--force" not in sys.argv:
         print("[wolfpack-sync] nothing changed on Spotify")
     else:
-        step("copy to ori-san", ["rsync", "-a", "--chmod=F644", f"{MUSIC}/", LIBRARY])
+        step("copy to ori-san", ["rsync", "-a", "--chmod=F644", "--exclude=.tmp", f"{MUSIC}/", LIBRARY])
         env = {**os.environ, "NAVIDROME_URL": navidrome()}
         step("Navidrome scan", ["python3", "-I", "navidrome-playlists.py", "scan"], env=env)
         for _ in range(60):
