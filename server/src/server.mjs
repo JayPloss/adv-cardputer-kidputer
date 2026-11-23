@@ -37,6 +37,11 @@ const config = {
     naomie: process.env.SUPACHAT_NAOMIE_DEVICE_TOKEN_HASH || '',
     theo: process.env.SUPACHAT_THEO_DEVICE_TOKEN_HASH || '',
   },
+  // Extra keys that sign in as an existing person without being their device: Ben's hub posts as Papa
+  // with its own key, so it can be revoked alone and Papa's device token never has to be shared.
+  serviceTokenHashes: [
+    ['papa', process.env.SUPACHAT_PAPA_HUB_TOKEN_HASH || ''],
+  ],
 };
 const policyVersion = '2026-08-21';
 
@@ -447,7 +452,7 @@ function deviceUser(req) {
   if (!value.startsWith('Bearer ')) return null;
   const digest = createHash('sha256').update(value.slice(7)).digest('hex');
   const actual = Buffer.from(digest);
-  for (const [userId, tokenHash] of Object.entries(config.deviceTokenHashes)) {
+  for (const [userId, tokenHash] of [...Object.entries(config.deviceTokenHashes), ...config.serviceTokenHashes]) {
     if (!tokenHash) continue;
     const expected = Buffer.from(tokenHash);
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) continue;

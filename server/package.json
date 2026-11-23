@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node --experimental-sqlite src/server.mjs",
-    "test": "node --experimental-sqlite --test test/server.test.mjs test/parent-controls.test.mjs"
+    "test": "node --experimental-sqlite --test test/server.test.mjs test/parent-controls.test.mjs test/hub-token.test.mjs"
   },
   "devDependencies": {
     "playwright": "^1.54.2",
