@@ -4752,7 +4752,7 @@ os::Owner frontApp() {
 constexpr uint32_t kCardSyncFirstMs = 60000;
 constexpr uint32_t kCardSyncEveryMs = 5 * 60000;  // one small request when nothing changed (the playlist's changed time)
 constexpr uint32_t kCardSyncRetryMs = 10 * 60000;
-constexpr uint32_t kCardSyncMoreMs = 2 * 60000;  // More songs to get, or the connection was busy.
+constexpr uint32_t kCardSyncMoreMs = 20000;  // More songs or lyrics to get, or the connection was busy: chat's turn first.
 uint32_t nextCardSyncAt = kCardSyncFirstMs;
 bool cardSyncWasRunning = false;
 int cardSyncNews = 0;

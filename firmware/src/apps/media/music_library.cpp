@@ -656,6 +656,12 @@ String syncAddedNames;  // Written by the sync task, read once it has ended.
 int syncNamesListed = 0;
 volatile int syncTotal = -1, syncDone = 0, syncMissing = 0;
 const char *volatile syncState = "NOT RUN YET";
+// A pass holds the one network connection, so chat can't check for messages while it runs. After this long
+// it ends at the next song or lyric (never mid-file: a half song is thrown away) and the next pass follows
+// in kCardSyncMoreMs, once chat has had its turn (notify-reboot, 2026-11-23: a message waited a whole pass).
+constexpr uint32_t kSyncSliceMs = 45000;
+uint32_t syncPassStartedAt = 0;
+bool sliceOver() { return millis() - syncPassStartedAt >= kSyncSliceMs; }
 
 // card.py's safe(): \/:*?"<>| become _, then dots and spaces come off both ends.
 void safeName(const char *in, String &out) {
@@ -858,7 +864,7 @@ bool syncLyrics(const String &folder, const String &manifest) {
     const String stem = folder + "/" + songStem(name);
     if (!SD.exists(folder + "/" + name)) continue;
     if (!everySong && (SD.exists(stem + ".lrc") || SD.exists(stem + ".nolrc"))) continue;
-    if (fetched >= kLyricsPerPass) { complete = false; break; }
+    if (fetched >= kLyricsPerPass || (fetched > 0 && sliceOver())) { complete = false; break; }
     if (!fetchLyrics(id, folder, name)) { complete = false; break; }
     fetched++;
   }
@@ -971,7 +977,7 @@ void syncPlaylist(const String &playlistId, const String &playlistName, bool rin
     if (tab <= 0) continue;
     const String id = line.substring(0, tab), name = line.substring(tab + 1);
     if (onCard(folder + "/" + name) || deletedOnDevice(folder, name)) continue;
-    if (syncDone >= cap) { syncState = "MORE TO GET"; break; }
+    if (syncDone >= cap || (syncDone > 0 && sliceOver())) { syncState = "MORE TO GET"; break; }
     // The card file stays closed while a song downloads: two open files is RAM the player may want.
     list.close();
     if (renameRenumbered(folder, name)) { syncDone = syncDone + 1; }
@@ -997,7 +1003,7 @@ void syncPlaylist(const String &playlistId, const String &playlistName, bool rin
 }
 
 void syncPass() {
-  syncDone = 0; syncMissing = 0;
+  syncDone = 0; syncMissing = 0; syncPassStartedAt = millis();
   if (!configured()) { syncState = "SERVER NOT SET UP"; return; }
   if (WiFi.status() != WL_CONNECTED) { syncState = "NO WIFI"; return; }
   if (!SD.exists("/")) { syncState = "NO CARD"; return; }
