@@ -3,6 +3,7 @@ import os, sys, json, subprocess, hashlib, secrets, urllib.request, urllib.parse
 from pathlib import Path
 sp = Path(os.environ.get("CARDPUTER_MUSIC_DATA", Path.home() / ".local/share/cardputer-music")); HOST = os.environ.get("NAVIDROME_URL", "http://192.168.0.235:4533")
 pl = json.loads((sp / "playlists.json").read_text()); files = json.loads((sp / "files.json").read_text())
+SECRET_TITLE, SECRET_AFTER = "Top Secret Song", 20
 def call(user, ep, params):
     pw = subprocess.run(["secret-tool", "lookup", "service", "navidrome", "account", user], capture_output=True, text=True).stdout.strip()
     salt = secrets.token_hex(6)
@@ -28,8 +29,14 @@ for kid, keys in pl["lists"].items():
             titled = [t for t in titled if first in (t.get("artist") or "").replace("\xa0", " ").lower()]
         return titled[0]["id"] if len(titled) == 1 else None
     ids = [pick(k) for k in keys]
+    # Twenty songs or more earn the song the startup melody comes from, last, under its code name only
+    # (Jay, 2026-11-23): "TS - Top Secret Song", a file in the Wolfpack album tagged with nothing else.
+    # Which song it is stays out of this repo and off the screens.
+    secret = [t["id"] for t in found if t["title"] == SECRET_TITLE and t.get("artist") == "TS"]
+    listed = sum(1 for i in ids if i)
+    if listed >= SECRET_AFTER and secret: ids.append(secret[0])
     missing = [files.get(k) or k for k, i in zip(keys, ids) if not i]
     for p in call(user, "getPlaylists", []).get("playlists", {}).get("playlist", []):
         if p["name"] == kid: call(user, "deletePlaylist", [("id", p["id"])])
     call(user, "createPlaylist", [("name", kid)] + [("songId", i) for i in ids if i])
-    print(f"{kid}: {sum(1 for i in ids if i)}/{len(keys)} in playlist" + (f"; missing {missing}" if missing else ""))
+    print(f"{kid}: {listed}/{len(keys)} in playlist" + (" with TS" if secret and secret[0] in ids else "") + (f"; missing {missing}" if missing else ""))

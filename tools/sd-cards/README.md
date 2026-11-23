@@ -1,5 +1,7 @@
 # Kids' music: Spotify playlists to Navidrome and SD cards
 
+A playlist of 20 songs or more also gets "TS - Top Secret Song" at its end: the song the startup melody comes from, ripped once by hand into the Wolfpack album with only that code name in its tags (no lyrics, no cover). Which song it is isn't written anywhere in this repo.
+
 **Automatic since 2026-11-21:** `wolfpack-sync.py` runs steps 1 to 4 plus the lyrics on its own: it fetches
 each playlist's Spotify page again, matches and rips only the new songs (a weak match waits in
 `<data>/needs-a-look.txt` for a `FIX` entry in `rip.py`), copies them to ori-san, rescans Navidrome and makes
