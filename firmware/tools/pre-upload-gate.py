@@ -64,5 +64,38 @@ def run_device_contract_gate(source, target, env):
             handle.write(key + "\n")
 
 
+def backup_device_settings(source, target, env):
+    """Copy the device's settings partition (NVS: chat login, Wi-Fi, alarms, outbox) off the device before every
+    flash, so a lost or broken Cardputer can be restored onto another one. Saved outside the repo (it holds secrets),
+    under ~/Backups/cardputer-nvs/<name>/. A device that can't be read blocks the flash."""
+    import datetime, re
+    port = env.subst("$UPLOAD_PORT")
+    if not port or not os.path.exists(port):
+        print(f"Settings backup: no device at {port or '(no port)'}; nothing to back up.")
+        return
+    esptool = [env.subst("$PYTHONEXE"), os.path.join(env.PioPlatform().get_package_dir("tool-esptoolpy"), "esptool.py"),
+               "--chip", "esp32s3", "--port", port]
+    mac = subprocess.run(esptool + ["--before", "default_reset", "--after", "no_reset", "read_mac"],
+                         capture_output=True, text=True)
+    found = re.search(r"MAC: ([0-9a-f:]{17})", mac.stdout)
+    if not found:
+        raise RuntimeError(f"Settings backup: couldn't read the device's MAC on {port}; flash blocked.\n{mac.stdout}{mac.stderr}")
+    mac = found.group(1)
+    names = os.path.join(env["PROJECT_DIR"], "..", "skills", "flash-cardputer-safely", "scripts", "resolve-device.ps1")
+    known = {m.lower(): n for m, n in re.findall(r"'([0-9A-Fa-f:]{17})'\s*=\s*@\{\s*Name='([^']+)'", open(names).read())}
+    name = known.get(mac, "unknown")
+    folder = os.path.expanduser(os.path.join("~", "Backups", "cardputer-nvs", name))
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    out = os.path.join(folder, f"{stamp}-{mac.replace(':', '')}-before-{env['PIOENV']}.bin")
+    read = subprocess.run(esptool + ["--baud", "921600", "--before", "no_reset", "--after", "no_reset",
+                                     "read_flash", "0x9000", "0x5000", out], capture_output=True, text=True)
+    if read.returncode or not os.path.exists(out) or os.path.getsize(out) != 0x5000:
+        raise RuntimeError(f"Settings backup: reading settings from {name} ({mac}) failed; flash blocked.\n{read.stderr}")
+    os.chmod(out, 0o600)
+    print(f"Settings backup: {name} ({mac}) saved to {out}")
+
+
 if any(target in COMMAND_LINE_TARGETS for target in ("upload", "program")):
     env.AddPreAction("upload", run_device_contract_gate)
+    env.AddPreAction("upload", backup_device_settings)

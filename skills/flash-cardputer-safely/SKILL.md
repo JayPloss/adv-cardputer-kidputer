@@ -19,6 +19,10 @@ gates below apply to firmware mutation, not to a read-only identity lookup.
 4. Stop on an unknown or ambiguous MAC.
 5. Compile the exact environment before upload.
 6. Upload only to the currently resolved port and require all esptool hashes to verify.
+   Flash only with `pio run -e <env> -t upload --upload-port <port>`: it first saves the device's settings
+   (NVS: chat login, Wi-Fi, alarms, outbox) to `~/Backups/cardputer-nvs/<name>/`, and blocks the flash if it
+   can't. A raw `esptool write_flash` skips that backup. To move a broken device's identity onto another:
+   `esptool.py --chip esp32s3 --port <port> write_flash 0x9000 <backup>.bin`, then flash its build.
 7. Provision NVS only from the private credential source; never print or commit secrets.
 8. Never claim powered-runtime success from upload output.
 
