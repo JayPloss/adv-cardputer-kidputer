@@ -14,7 +14,8 @@ Kidputer: one firmware of apps for pre-phone-age kids on the Cardputer ADV (Supa
 - Identification is a lightweight read-only operation. Do not run release,
   emulator, build, provisioning, or flash gates unless the user also requested
   the corresponding action.
-- Physical Cardputers: Papa, Albie, Julien (Juju), Emmanuelle, Naomie, Andrew.
+- Physical Cardputers: Albie, Julien (Juju), Emmanuelle, Naomie, Andrew. On 2026-11-23 Albie's
+  first Cardputer broke and he got Papa's, with his own settings copied over; Papa has none for now.
   Mama has no physical Cardputer: the `mama` build and account exist, but there
   is nothing to flash or catch up.
 - Report the resolved name, MAC, PlatformIO environment, and current COM port

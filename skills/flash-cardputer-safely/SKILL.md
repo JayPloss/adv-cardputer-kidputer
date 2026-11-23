@@ -14,7 +14,7 @@ gates below apply to firmware mutation, not to a read-only identity lookup.
 1. Run `$emulate-cardputer-contracts` first.
 2. List serial devices and identify the MAC. Do not select by remembered COM port alone.
 3. Map only known identities:
-   - Albie: `28:84:85:75:75:a0`, environment `cardputer-adv`.
+   - Albie: `28:84:85:76:a4:94` (Papa's former hardware, since 2026-11-23), environment `cardputer-adv`.
    - Julien/Juju: `28:84:85:75:5e:fc`, environment `juju`.
 4. Stop on an unknown or ambiguous MAC.
 5. Compile the exact environment before upload.
