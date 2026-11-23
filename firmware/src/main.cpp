@@ -81,7 +81,7 @@ const char *failureText(const char *english) {
   if (frenchUi) for (const auto &pair : kFrench) if (!strcmp(english, pair[0])) return pair[1];
   return english;
 }
-constexpr char kFirmwareVersion[] = "v0.64";
+constexpr char kFirmwareVersion[] = "v0.65";
 // The author of the device's own notes to its owner: no account has this id.
 constexpr char kNoticeAuthor[] = "kidputer";
 // Lyrics show only when asked for: L (lyrics) in English, P (paroles) in French, turns them on and off; remembered.
@@ -2855,17 +2855,19 @@ void drawFoxFinding() {
 }
 
 // HOME and its apps. SUPACHAT is the existing chat; the others live below.
-enum class AppId : uint8_t { Chat, Music, Books, Remote, Timer, Alarm, ScreenTime, Stopwatch, Wifi, Volume, Status, Language, Charging, Local, Changelog, System };
+enum class AppId : uint8_t { Chat, Music, Books, Remote, Timer, Alarm, Clock, ScreenTime, Stopwatch, Wifi, Volume, Status, Language, Charging, Local, Changelog, System };
 struct HomeApp { AppId id; const char *english; const char *french; };
 // Pages of four, in order. A label fits a tile at 9 characters: see design-reference-cardputer.
 constexpr HomeApp kHomeApps[] = {{AppId::Chat, "SUPACHAT", "SUPACHAT"}, {AppId::Music, "MUSIC", "MUSIQUE"}, {AppId::Books, "BOOKS", "LIVRES"}, {AppId::Remote, "R/C", "R/C"},
-                                 {AppId::Timer, "TIMER", "MINUTEUR"}, {AppId::Alarm, "ALARM", "REVEIL"}, {AppId::ScreenTime, "SCREEN", "ECRAN"}, {AppId::Stopwatch, "STOPWATCH", "CHRONO"},
+                                 {AppId::Timer, "TIMER", "MINUTEUR"}, {AppId::Alarm, "ALARM", "REVEIL"}, {AppId::Clock, "CLOCK", "HORLOGE"}, {AppId::Stopwatch, "STOPWATCH", "CHRONO"},
                                  {AppId::Wifi, "WI-FI", "WI-FI"}, {AppId::Volume, "VOLUME", "VOLUME"}, {AppId::Status, "STATUS", "ETAT"}, {AppId::Language, "LANGUAGE", "LANGUE"},
-                                 {AppId::Charging, "CHARGING", "CHARGE"}, {AppId::Local, "LOCAL OFF", "LOCAL NON"}, {AppId::Changelog, "CHANGELOG", "VERSIONS"}, {AppId::System, "SYSTEM", "SYSTEME"}};
+                                 {AppId::Charging, "CHARGING", "CHARGE"}, {AppId::Local, "LOCAL OFF", "LOCAL NON"}, {AppId::Changelog, "CHANGELOG", "VERSIONS"}, {AppId::System, "SYSTEM", "SYSTEME"},
+                                 // Screen time made room for CLOCK beside TIMER and ALARM (Albie, 2026-11-22); the other tiles kept their places.
+                                 {AppId::ScreenTime, "SCREEN", "ECRAN"}};
 constexpr int kHomeAppCount = sizeof(kHomeApps) / sizeof(kHomeApps[0]);
 constexpr int kHomeAppsPerPage = 4;
-constexpr int kHomePageCount = kHomeAppCount / kHomeAppsPerPage;
-static_assert(kHomeAppCount % kHomeAppsPerPage == 0, "HOME's pages are full pages");
+// The last page may be short: its empty tiles aren't drawn, and a move onto one bumps.
+constexpr int kHomePageCount = (kHomeAppCount + kHomeAppsPerPage - 1) / kHomeAppsPerPage;
 int homeSelection = 0;
 // The bump at the end of the pages: the grid knocks against the edge it can't pass, then settles.
 constexpr uint32_t kHomeBumpMs = 240;
@@ -2931,6 +2933,7 @@ void drawHome() {
   }
   for (int slot = 0; slot < kHomeAppsPerPage; slot++) {
     const int index = page * kHomeAppsPerPage + slot;
+    if (index >= kHomeAppCount) break;
     const int x = 6 + (slot % 2) * 117 + bump; const int y = 24 + (slot / 2) * 41; const bool selected = index == homeSelection;
     display.fillRoundRect(x, y, 111, 36, 4, selected ? TFT_GREEN : TFT_DARKGREY);
     display.setTextSize(2); display.setTextColor(selected ? TFT_BLACK : TFT_WHITE, selected ? TFT_GREEN : TFT_DARKGREY);
@@ -4573,6 +4576,11 @@ void openHomeApp(int index) {
   else if (app == AppId::Remote) screenMode = ScreenMode::Remote;
   else if (app == AppId::Timer) { timerTyped = 0; screenMode = ScreenMode::Timer; }
   else if (app == AppId::Alarm) { alarmTyped.clear(); alarmRow = 0; alarmColumn = AlarmColumn::Time; screenMode = ScreenMode::Alarm; }
+  else if (app == AppId::Clock) {
+    // The big clock on demand, as after two idle minutes: the first key brings HOME back.
+    if (!idleClockAllowed()) { homeNotice = uiText("CLOCK NOT SET YET", "HEURE PAS ENCORE REGLEE"); homeNoticeAt = millis(); homeNoticeGood = false; bumpHome(0); return; }
+    setIdleClock(true); return;
+  }
   else if (app == AppId::ScreenTime) screenMode = ScreenMode::ScreenTime;
   else if (app == AppId::Stopwatch) screenMode = ScreenMode::Stopwatch;
   else if (app == AppId::Wifi) {
@@ -4914,18 +4922,21 @@ bool handleAppKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown
   if (screenMode == ScreenMode::Home) {
     const int page = homeSelection / kHomeAppsPerPage; const int slot = homeSelection % kHomeAppsPerPage;
     const bool onLeft = slot % 2 == 0;
+    const int before = homeSelection;
     if (goUp || goDown) homeSelection = page * kHomeAppsPerPage + (slot + 2) % kHomeAppsPerPage;
     else if (goLeft && onLeft) {
       if (page == 0) { bumpHome(-1); return true; }
       homeSelection = (page - 1) * kHomeAppsPerPage + slot + 1;
     } else if (goRight && !onLeft) {
       if (page + 1 == kHomePageCount) { bumpHome(1); return true; }
-      homeSelection = (page + 1) * kHomeAppsPerPage + slot - 1;
+      homeSelection = std::min((page + 1) * kHomeAppsPerPage + slot - 1, kHomeAppCount - 1);  // onto a short page: its last tile
     } else if (goLeft || goRight) homeSelection += onLeft ? 1 : -1;
+    if (homeSelection >= kHomeAppCount) { homeSelection = before; bumpHome(goRight ? 1 : 0); return true; }
+    if (goUp || goDown || goLeft || goRight) {}
     else if (keys.enter) { openHomeApp(homeSelection); if (homeBumpAt) return true; }
     else {
       for (const auto character : keys.word) {
-        if (character >= '1' && character < '1' + kHomeAppsPerPage) { homeSelection = page * kHomeAppsPerPage + (character - '1'); openHomeApp(homeSelection); if (homeBumpAt) return true; }
+        if (character >= '1' && character < '1' + kHomeAppsPerPage && page * kHomeAppsPerPage + (character - '1') < kHomeAppCount) { homeSelection = page * kHomeAppsPerPage + (character - '1'); openHomeApp(homeSelection); if (homeBumpAt) return true; }
         else if (character == '0') screenMode = ScreenMode::System;
       }
     }

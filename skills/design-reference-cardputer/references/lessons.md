@@ -63,3 +63,7 @@ Each item says where it came from. Add to this list; don't delete from it unless
 
 - **The line being sung is read at a glance, so it is Font0 x2, never x1.** Two lines of 19 characters, broken at a space; the next line is x1 grey under it, the title x1 grey above with a 6 px bar, and the clock times give way. A line too long for two lines is cut with `~`, never shrunk (fonts.md: pick the size first). Shown only for songs on the card with a timed `.lrc`; without one the player is unchanged (runtime emulator `card-sync`, `lyrics.png`, 2026-11-21).
 - **A letter key is the first letter of the word its hint shows, in the device's language.** L LYRICS / P PAROLES, F FAVOURITE / A AIME. Getting there took four tries on 2026-11-21: P on both languages, L for AIME, then F beside the word LIKE, then P beside SANS PAROLES (Jay). Check the letter against the word printed next to it on the screen, in both languages, not against a word in your head.
+
+## HOME (v0.65)
+
+- **A new app takes the place of the one used least, not a slot that shifts every tile after it.** CLOCK went beside TIMER and ALARM (Albie, 2026-11-22), and SCREEN moved to a fifth page of its own, so every other tile kept the position the kids' thumbs know. The last page may be short: its empty tiles aren't drawn, Up or Down onto one bumps, and Right from either row lands on its last tile.
