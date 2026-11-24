@@ -43,6 +43,8 @@ NOT_EMULATED = {
                         "so a clock lost with the power (unknown tier, high-water mark) can't be shown",
     "sntp_restart": "lwIP's SNTP client; the emulator answers the time at once, so the re-ask on a Wi-Fi rejoin "
                     "and the drift it corrects aren't exercised",
+    "gettimeofday": "the chip's clock; the emulator's time is its virtual wall clock, read to the second, so "
+                    "sub-second drift isn't seen",
 }
 # Scenarios skipped because what they check depends on a function above, and why.
 NOT_EMULATED_SCENARIOS = {

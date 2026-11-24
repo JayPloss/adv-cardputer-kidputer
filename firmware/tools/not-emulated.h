@@ -25,3 +25,19 @@ inline esp_reset_reason_t esp_reset_reason() { return ESP_RST_SW; }
 //    client: its configTzTime answers at once whenever its network is up. The stand-in does nothing.
 //    Not covered: the re-ask on a Wi-Fi rejoin, and the drift a real answer corrects (/supachat-clock.csv).
 inline bool sntp_restart() { return true; }
+
+// 3. gettimeofday() / settimeofday(): the chip's own clock. In the emulator settimeofday does nothing and the
+//    device's time is the scenario's virtual wall clock, which only getLocalTime reads (libc's gettimeofday
+//    there is the PC's clock). The stand-in reads the virtual clock, to the second, so the clock-trust code
+//    sees the same time the screens show. Not covered: sub-second readings, so the drift logged on a sync
+//    is whole seconds here.
+#include <sys/time.h>
+#include <time.h>
+inline int emuChipClock(struct timeval *value) {
+  struct tm local{};
+  getLocalTime(&local, 0);
+  value->tv_sec = mktime(&local);
+  value->tv_usec = 0;
+  return 0;
+}
+#define gettimeofday(value, zone) emuChipClock(value)
