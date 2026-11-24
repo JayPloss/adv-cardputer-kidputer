@@ -4965,7 +4965,7 @@ bool handleMorningKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool go
 
 // On the network task, while on Wi-Fi with nothing playing: today's and tomorrow's briefs onto the card.
 bool downloadToCard(const String &path, const String &file, int expectedBytes) {
-  vTaskDelay(pdMS_TO_TICKS(20));  // between handshakes, as above
+  vTaskDelay(pdMS_TO_TICKS(250));  // between handshakes, as above
   const os::SecureLease lease(os::Priority::Background);
   if (!lease.held) return false;
   WiFiClientSecure client;
@@ -5007,9 +5007,10 @@ void serviceMorningDownload() {
   if (millis() < kMorningFirstFetchMs) return;
   if (!morningFetchNow && millis() - lastMorningFetchAt < kMorningFetchEveryMs) return;
   morningFetchNow = false; lastMorningFetchAt = millis();
-  // A handshake is about 1.5 s of software ECC on core 0: a tick between secure connections lets core 0's idle
-  // task run, or a sync followed at once by this fetch starves the watchdog (runtime emulator, watchdog.scn).
-  vTaskDelay(pdMS_TO_TICKS(20));
+  // A handshake is about 1.5 s of software ECC on core 0, and chat's sync has just done its own: a second's
+  // pause lets core 0's idle task run, or the two back to back starve the watchdog (runtime emulator, watchdog
+  // and charge-normal). Every 30 minutes, so the second costs nothing.
+  vTaskDelay(pdMS_TO_TICKS(1000));
   String response; int status = 0;
   requestJson("/api/device/morning", "GET", "", response, status);
   if (status != 200) { if (status != 404) Serial.printf("MORNING list status=%d\n", status); return; }
