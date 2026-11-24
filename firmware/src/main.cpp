@@ -5,6 +5,8 @@
 #include <Preferences.h>
 #include "changelog.h"
 #include "apps/time/clock_apps.h"
+#include "apps/time/clock_trust.h"
+#include "apps/time/morning.h"
 #include "apps/chat/fox_finding.h"
 #include "apps/system/french_keyboard.h"
 #include "apps/chat/outbox.h"
@@ -81,7 +83,7 @@ const char *failureText(const char *english) {
   if (frenchUi) for (const auto &pair : kFrench) if (!strcmp(english, pair[0])) return pair[1];
   return english;
 }
-constexpr char kFirmwareVersion[] = "v0.65";
+constexpr char kFirmwareVersion[] = "v0.66";
 // The author of the device's own notes to its owner: no account has this id.
 constexpr char kNoticeAuthor[] = "kidputer";
 // Lyrics show only when asked for: L (lyrics) in English, P (paroles) in French, turns them on and off; remembered.
@@ -307,7 +309,7 @@ struct ListsLock {
   ~ListsLock() { xSemaphoreGive(sharedListsMutex); }
 };
 
-enum class ScreenMode { Chat, Menu, Rooms, Volume, Language, EmojiRecipes, Changelog, VoiceMessages, Walkie, Status, Networks, NetworkPassword, ChargingConfirm, Charging, FoxFinding, Home, Library, LibrarySearch, NowPlaying, Remote, System, Timer, Alarm, ScreenTime, Stopwatch, KeyHelp };
+enum class ScreenMode { Chat, Menu, Rooms, Volume, Language, EmojiRecipes, Changelog, VoiceMessages, Walkie, Status, Networks, NetworkPassword, ChargingConfirm, Charging, FoxFinding, Home, Library, LibrarySearch, NowPlaying, Remote, System, Timer, Alarm, ScreenTime, Stopwatch, KeyHelp, Morning, Agenda };
 
 Preferences preferences;
 M5Canvas uiCanvas(&M5Cardputer.Display);
@@ -1067,11 +1069,11 @@ void rememberWifi(const String &ssid, const String &password) {
   saveWifiProfiles();
 }
 
+bool ruleClock(struct tm &value);
 bool localBlackout() {
   if (!kBlackoutEnabled) return false;
-  if (!timeKnown) return false;
   struct tm value{};
-  if (!getLocalTime(&value, 100)) return false;
+  if (!ruleClock(value)) return false;
   return value.tm_hour >= 22 || value.tm_hour < 6;
 }
 
@@ -1594,7 +1596,38 @@ bool connectKnownWifi() {
   return true;
 }
 
-void onTimeSynced(struct timeval *) { clockFromNtp = true; }
+// ---- How far the clock can be trusted (docs/morning-overview.md, part A) ----
+// The chip keeps counting through light sleep and a restart, but not a power-on. What it knew is kept in NVS
+// (namespace "clock") so a restart, sleep or a pulled battery never leaves a blank clock.
+clocktrust::State clockTrust;
+uint32_t lastClockMarkAt = 0;
+// SNTP's callback runs on lwIP's task: it leaves the answer here and the loop takes it in.
+volatile bool clockSyncArrived = false;
+volatile int64_t clockSyncAtUs = 0;
+volatile uint32_t clockSyncAtMs = 0;
+bool wifiWasJoined = false;  // The network task's: a new join asks the time servers again.
+// What the clock read just before, in the loop, to measure the drift a sync corrects.
+int64_t clockShadowUs = 0;
+uint32_t clockShadowMs = 0;
+
+int64_t clockNowUs() { timeval now{}; gettimeofday(&now, nullptr); return static_cast<int64_t>(now.tv_sec) * 1000000 + now.tv_usec; }
+int64_t clockNowS() { return clockNowUs() / 1000000; }
+clocktrust::Tier clockTier() { return clocktrust::tier(clockTrust, clockNowS()); }
+
+void saveClockState(bool includeBoot = false) {
+  Preferences clockStore;
+  if (!clockStore.begin("clock", false)) return;
+  // UTC seconds fit 32 bits until 2106.
+  clockStore.putUInt("synced", static_cast<uint32_t>(clockTrust.synced));
+  clockStore.putUInt("hwm", static_cast<uint32_t>(clockTrust.mark));
+  if (includeBoot) clockStore.putUInt("boot", static_cast<uint32_t>(clockNowS()));
+  clockStore.end();
+}
+
+void onTimeSynced(struct timeval *value) {
+  clockSyncAtUs = value ? static_cast<int64_t>(value->tv_sec) * 1000000 + value->tv_usec : clockNowUs();
+  clockSyncAtMs = millis(); clockSyncArrived = true; clockFromNtp = true;
+}
 
 // The clock is seeded from the build time, so a plausible year proves nothing: only SNTP's callback
 // says a server answered. SNTP keeps polling after this, so a first try that fails is not the last.
@@ -1610,34 +1643,90 @@ void ensureTime() {
   }
 }
 
-void seedBuildTime() {
-  // TLS certificate validation needs a plausible clock. The firmware build
-  // timestamp is a safe offline floor until NTP supplies the precise time.
+// The firmware's build time (UTC as written by the compiler's clock, close enough): the floor for TLS checks.
+int64_t buildEpoch() {
   static const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
   char monthName[4]{};
   int day = 0, year = 0, hour = 0, minute = 0, second = 0;
   if (sscanf(__DATE__, "%3s %d %d", monthName, &day, &year) != 3 ||
-      sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second) != 3) return;
+      sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second) != 3) return 0;
   const char *month = strstr(months, monthName);
-  if (!month) return;
+  if (!month) return 0;
   struct tm build{};
   build.tm_year = year - 1900; build.tm_mon = static_cast<int>((month - months) / 3);
   build.tm_mday = day; build.tm_hour = hour; build.tm_min = minute; build.tm_sec = second;
   setenv("TZ", "UTC0", 1); tzset();
   const time_t epoch = mktime(&build);
-  if (epoch <= 1704067200) return;
-  timeval value{epoch, 0};
-  settimeofday(&value, nullptr); timeKnown = true;
   setenv("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2", 1); tzset();
+  return epoch > 1704067200 ? static_cast<int64_t>(epoch) : 0;
 }
+
+// At boot, before anything sets the clock: keep the chip's time if it survived, otherwise start from the last
+// time known. Either way there is a time to show; clockTier() says how far to trust it.
+void startClock() {
+  clocktrust::Stored stored;
+  Preferences clockStore;
+  if (clockStore.begin("clock", true)) {
+    stored.synced = clockStore.getUInt("synced", 0); stored.boot = clockStore.getUInt("boot", 0); stored.mark = clockStore.getUInt("hwm", 0);
+    clockStore.end();
+  }
+  const esp_reset_reason_t reason = esp_reset_reason();
+  const bool powerOn = reason == ESP_RST_POWERON || reason == ESP_RST_BROWNOUT || reason == ESP_RST_UNKNOWN;
+  const int64_t chipNow = clockNowS();
+  const clocktrust::Boot boot = clocktrust::onBoot(stored, chipNow, powerOn, buildEpoch());
+  clockTrust = boot.state;
+  if (boot.setTo > 0) { timeval value{static_cast<time_t>(boot.setTo), 0}; settimeofday(&value, nullptr); }
+  setenv("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2", 1); tzset();
+  timeKnown = true;
+  clockShadowUs = clockNowUs(); clockShadowMs = millis();
+  saveClockState(true);
+  static const char *const kTierNames[] = {"synced", "estimated", "unknown"};
+  Serial.printf("CLOCK boot reset=%d chip=%lld kept=%d set=%lld synced=%lld mark=%lld last_boot=%lld tier=%s\n", static_cast<int>(reason),
+                static_cast<long long>(chipNow), clockTrust.chipKept, static_cast<long long>(boot.setTo), static_cast<long long>(stored.synced),
+                static_cast<long long>(stored.mark), static_cast<long long>(stored.boot), kTierNames[static_cast<int>(clockTier())]);
+}
+
+// In the loop: takes in a time server's answer (logging the drift it corrected), keeps the high-water mark.
+void serviceClockTrust() {
+  const uint32_t nowMs = millis();
+  if (clockSyncArrived) {
+    clockSyncArrived = false;
+    const int64_t syncUs = clockSyncAtUs;
+    const clocktrust::Tier was = clocktrust::tier(clockTrust, clockShadowUs / 1000000);
+    // Where the clock would be had the answer not come: the last reading plus the time since, by millis().
+    const int64_t expectedUs = clockShadowUs + static_cast<int64_t>(static_cast<int32_t>(clockSyncAtMs - clockShadowMs)) * 1000;
+    const double driftS = static_cast<double>(syncUs - expectedUs) / 1e6;
+    const double sinceH = clockTrust.synced > 0 ? static_cast<double>(syncUs / 1000000 - clockTrust.synced) / 3600.0 : -1;
+    static const char *const kTierNames[] = {"synced", "estimated", "unknown"};
+    Serial.printf("CLOCK sync drift %+.1f s after %.1f h, was %s\n", driftS, sinceH, kTierNames[static_cast<int>(was)]);
+    if (sdReady && !media::active() && !library::cardSyncRunning()) {
+      // utc_s,firmware,tier_before,hours_since_sync,drift_s: how far the chip's clock wanders, per device.
+      File log = SD.open("/supachat-clock.csv", FILE_APPEND);
+      if (log) { log.printf("%lld,%s,%s,%.1f,%.2f\n", static_cast<long long>(syncUs / 1000000), kFirmwareVersion, kTierNames[static_cast<int>(was)], sinceH, driftS); log.close(); }
+    }
+    clocktrust::onSync(clockTrust, syncUs / 1000000);
+    saveClockState(); lastClockMarkAt = nowMs; renderDirty = true;
+  }
+  if (nowMs - clockShadowMs >= 1000) { clockShadowUs = clockNowUs(); clockShadowMs = nowMs; }
+  if (nowMs - lastClockMarkAt >= 10 * 60000u) {
+    lastClockMarkAt = nowMs;
+    if (clocktrust::advanceMark(clockTrust, clockNowS())) saveClockState();
+  }
+}
+
+// Before light sleep: the latest trusted time, in case the battery runs out while asleep.
+void markClockNow() { if (clocktrust::advanceMark(clockTrust, clockNowS())) saveClockState(); lastClockMarkAt = millis(); }
 
 String easternClockText() {
   if (!timeKnown) return "--:--";
   struct tm value{};
   if (!getLocalTime(&value, 20)) return "--:--";
   const int hour = value.tm_hour % 12 == 0 ? 12 : value.tm_hour % 12;
-  char clockText[8]{};
-  snprintf(clockText, sizeof(clockText), "%d:%02d%c", hour, value.tm_min, value.tm_hour < 12 ? 'A' : 'P');
+  char clockText[10]{};
+  // ~ on a clock the chip kept since its last sync, ? on one guessed after a power loss.
+  const clocktrust::Tier tier = clockTier();
+  const char *mark = tier == clocktrust::Tier::Synced ? "" : tier == clocktrust::Tier::Estimated ? "~" : "?";
+  snprintf(clockText, sizeof(clockText), "%s%d:%02d%c", mark, hour, value.tm_min, value.tm_hour < 12 ? 'A' : 'P');
   return String(clockText);
 }
 
@@ -1962,6 +2051,7 @@ bool uploadVoiceClip() {
   voiceUploadPending = false; voiceClientId = ""; walkieStatus = "CLIP SENT"; renderDirty = true; return true;
 }
 
+void serviceMorningDownload();
 bool downloadVoiceClip(int64_t messageId) {
   const os::SecureLease lease(os::Priority::Foreground, 5000);
   if (!lease.held) return false;
@@ -2325,6 +2415,7 @@ void networkTask(void *) {
     if (wifiResumeRequested) { wifiResumeRequested = false; nextWifiAttempt = 0; wifiRetryMs = 0; syncBackoffMs = 0; }
     const uint32_t now = millis();
     if (WiFi.status() != WL_CONNECTED && now < nextWifiAttempt) { vTaskDelay(pdMS_TO_TICKS(250)); continue; }
+    if (WiFi.status() != WL_CONNECTED) wifiWasJoined = false;
     if (!connectKnownWifi()) {
       noteServerStage(ServerStage::NoWifi, 0, "");
       if (!os::bootSettled()) os::setBoot(os::Boot::NoNetwork);
@@ -2335,7 +2426,11 @@ void networkTask(void *) {
     wifiRetryMs = 0;
     applyRadioSleep();
     if (os::boot() == os::Boot::Joining) os::setBoot(os::Boot::Syncing);
+    const bool firstAsk = !ntpAttempted;
     ensureTime();
+    // Back on Wi-Fi with a clock that isn't fresh: ask the time servers now, not at SNTP's next hourly poll.
+    if (!wifiWasJoined && !firstAsk && clockTier() != clocktrust::Tier::Synced) { Serial.println("CLOCK asking the time servers again"); sntp_restart(); }
+    wifiWasJoined = true;
     if (localBlackout() && !syncOverride) {
       networkStatus = "BLACKOUT 22-06"; currentSsid = ""; renderDirty = true;
       WiFi.disconnect(true, false); nextWifiAttempt = millis() + 60000;
@@ -2370,6 +2465,7 @@ void networkTask(void *) {
     }
     os::setState(os::Owner::Chat, screenMode == ScreenMode::Chat ? os::AppState::Foreground : os::AppState::Background);
     if (voiceUploadPending && !localReplayActive) uploadVoiceClip();
+    serviceMorningDownload();
     if (syncOverride) syncOverride = false;
     // Blocks freed past the ledger's hooks (libc's own frees) would otherwise count against chat for good.
     if (millis() - lastReconcileAt > kChatReconcileMs) { lastReconcileAt = millis(); os::reconcile(os::Owner::Chat); }
@@ -2733,7 +2829,7 @@ void drawStatus() {
   } else if (statusPage == 1) {
     display.printf(frenchUi ? "APPAREIL  %s\n" : "NODE      %s\n", kDeviceName);
     display.printf("WIFI      %s\n", currentSsid.isEmpty() ? "offline" : currentSsid.get().c_str());
-    display.printf(frenchUi ? "ETAT      %s\n" : "STATE     %s\n", networkStatus.get().c_str()); display.printf(frenchUi ? "HEURE     %s\n" : "TIME      %s\n", timeKnown ? uiText("known", "connue") : uiText("unknown", "inconnue"));
+    display.printf(frenchUi ? "ETAT      %s\n" : "STATE     %s\n", networkStatus.get().c_str()); display.printf(frenchUi ? "HEURE     %s\n" : "TIME      %s\n", clockTier() == clocktrust::Tier::Synced ? uiText("synced", "a jour") : clockTier() == clocktrust::Tier::Estimated ? uiText("estimated", "estimee") : uiText("unknown", "inconnue"));
     display.printf(frenchUi ? "BATTERIE  %d%%  %d mV\n" : "BATTERY   %d%%  %d mV\n", batteryLevel, batteryVoltageMv);
     display.printf(frenchUi ? "ALIM.     %s\n" : "POWER     %s\n", externalPowerDetected ? uiText("cable detected", "cable detecte") : uiText("not detected", "non detecte"));
     display.printf("SD/KEY    %s / %s\n", sdReady ? "ready" : "missing", keyboardReady ? "ready" : "fault");
@@ -2855,7 +2951,7 @@ void drawFoxFinding() {
 }
 
 // HOME and its apps. SUPACHAT is the existing chat; the others live below.
-enum class AppId : uint8_t { Chat, Music, Books, Remote, Timer, Alarm, Clock, ScreenTime, Stopwatch, Wifi, Volume, Status, Language, Charging, Local, Changelog, System };
+enum class AppId : uint8_t { Chat, Music, Books, Remote, Timer, Alarm, Clock, ScreenTime, Stopwatch, Wifi, Volume, Status, Language, Charging, Local, Changelog, System, Agenda };
 struct HomeApp { AppId id; const char *english; const char *french; };
 // Pages of four, in order. A label fits a tile at 9 characters: see design-reference-cardputer.
 constexpr HomeApp kHomeApps[] = {{AppId::Chat, "SUPACHAT", "SUPACHAT"}, {AppId::Music, "MUSIC", "MUSIQUE"}, {AppId::Books, "BOOKS", "LIVRES"}, {AppId::Remote, "R/C", "R/C"},
@@ -2863,7 +2959,9 @@ constexpr HomeApp kHomeApps[] = {{AppId::Chat, "SUPACHAT", "SUPACHAT"}, {AppId::
                                  {AppId::Wifi, "WI-FI", "WI-FI"}, {AppId::Volume, "VOLUME", "VOLUME"}, {AppId::Status, "STATUS", "ETAT"}, {AppId::Language, "LANGUAGE", "LANGUE"},
                                  {AppId::Charging, "CHARGING", "CHARGE"}, {AppId::Local, "LOCAL OFF", "LOCAL NON"}, {AppId::Changelog, "CHANGELOG", "VERSIONS"}, {AppId::System, "SYSTEM", "SYSTEME"},
                                  // Screen time made room for CLOCK beside TIMER and ALARM (Albie, 2026-11-22); the other tiles kept their places.
-                                 {AppId::ScreenTime, "SCREEN", "ECRAN"}};
+                                 {AppId::ScreenTime, "SCREEN", "ECRAN"},
+                                 // The morning's agenda, to re-read after the alarm (v0.66): on the short page, so no tile moves.
+                                 {AppId::Agenda, "AGENDA", "AGENDA"}};
 constexpr int kHomeAppCount = sizeof(kHomeApps) / sizeof(kHomeApps[0]);
 constexpr int kHomeAppsPerPage = 4;
 // The last page may be short: its empty tiles aren't drawn, and a move onto one bumps.
@@ -3186,6 +3284,10 @@ void drawRemote() {
 void openAlarmSoundPicker();
 void beginAlarmSong();
 void stopAlarmSong();
+void stopMorningAudio();
+void morningAfterAlarm(uint8_t alarmHour);
+void drawMorning();
+void drawAgenda();
 
 // The clock apps. Their screens are navigation screens: the arrows need no Fn, and digits type times.
 enum class Ringing : uint8_t { None, Alarm, ScreenTime, Timer };
@@ -3200,8 +3302,19 @@ bool isClockScreen() {
   return screenMode == ScreenMode::Timer || screenMode == ScreenMode::Alarm || screenMode == ScreenMode::ScreenTime || screenMode == ScreenMode::Stopwatch;
 }
 
-// The wall clock, only once a time server has set it.
-bool wallClock(struct tm &value) { return clockFromNtp && getLocalTime(&value, 10); }
+// The time to show: there always is one, in every tier (clockTier() says how far to trust it).
+bool wallClock(struct tm &value) { return getLocalTime(&value, 10); }
+// The time alarms ring by: synced, or kept by the chip since a sync. Never a guess after a power loss, which is
+// behind by however long the device was off and would ring at a wrong hour.
+bool alarmClock(struct tm &value) { return clocktrust::alarmsRing(clockTrust, clockNowS()) && getLocalTime(&value, 10); }
+// The time the parents' quiet-time rules read: exact on a recent sync, 10 minutes late on a stale clock, and
+// none at all when the clock is unknown or over 72 h old (docs/morning-overview.md).
+bool ruleClock(struct tm &value) {
+  int64_t ruleNow = 0;
+  if (!clocktrust::rulesTime(clockTrust, clockNowS(), ruleNow)) return false;
+  const time_t at = static_cast<time_t>(ruleNow);
+  return localtime_r(&at, &value) != nullptr;
+}
 
 String alarmTimeText(uint8_t hour, uint8_t minute) {
   char text[12];
@@ -3383,8 +3496,9 @@ void drawAlarm() {
   } else if (alarmColumn == AlarmColumn::Sound && !alarmOnAddRow()) {
     // The song's name can hold accents: drawn below, through printFont0Text.
     statusColour = alarmSounds[alarmRow].length() ? TFT_GREEN : TFT_WHITE;
-  } else if (!wallClock(now)) {
-    snprintf(status, sizeof(status), "%s", uiText("CLOCK NOT SET: NEEDS WI-FI ONCE", "HEURE INCONNUE: IL FAUT LE WI-FI"));
+  } else if (!alarmClock(now)) {
+    // The battery ran out or the device was off: alarms are kept, and ring once Wi-Fi gives the time back.
+    snprintf(status, sizeof(status), "%s", uiText("TIME UNKNOWN: RINGS AFTER WI-FI", "HEURE INCONNUE: SONNE APRES WI-FI"));
     statusColour = TFT_RED;
   } else if (alarms.snoozed) {
     const uint32_t left = alarms.snoozeUntil - millis();
@@ -3393,10 +3507,12 @@ void drawAlarm() {
   } else {
     int next = -1;
     const int32_t minutes = alarms.minutesUntil(now.tm_wday, now.tm_hour, now.tm_min, &next);
+    // On a clock the chip kept since its last sync, the times are marked as estimates (~), not refused.
+    const char *mark = clockTier() == clocktrust::Tier::Estimated ? "~" : "";
     if (minutes < 0) snprintf(status, sizeof(status), "%s", alarms.count ? uiText("NO ALARM IS ON", "AUCUN REVEIL ACTIF") : "");
-    else if (minutes >= 60) snprintf(status, sizeof(status), "%s%d H %d MIN", uiText("NEXT RINGS IN ", "PROCHAIN DANS "), static_cast<int>(minutes / 60), static_cast<int>(minutes % 60));
-    else snprintf(status, sizeof(status), "%s%d MIN", uiText("NEXT RINGS IN ", "PROCHAIN DANS "), static_cast<int>(minutes));
-    statusColour = minutes < 0 ? TFT_DARKGREY : TFT_GREEN;
+    else if (minutes >= 60) snprintf(status, sizeof(status), "%s%s%d H %d MIN", mark, uiText("NEXT RINGS IN ", "PROCHAIN DANS "), static_cast<int>(minutes / 60), static_cast<int>(minutes % 60));
+    else snprintf(status, sizeof(status), "%s%s%d MIN", mark, uiText("NEXT RINGS IN ", "PROCHAIN DANS "), static_cast<int>(minutes));
+    statusColour = minutes < 0 ? TFT_DARKGREY : *mark ? TFT_YELLOW : TFT_GREEN;
   }
   display.setTextColor(statusColour, TFT_BLACK); display.setCursor(6, 112);
   if (alarmColumn == AlarmColumn::Sound && !alarmOnAddRow() && !alarmTyped.active()) {
@@ -3424,32 +3540,49 @@ void drawStopwatch() {
              stopwatch.running ? uiText("ENTER STOP         DEL RESET", "ENTER ARRET        DEL ZERO") : uiText("ENTER START        DEL RESET", "ENTER DEPART       DEL ZERO"));
 }
 
-// The big clock: 24-hour time across the screen, the date, and when the next alarm rings.
+// The big clock: 24-hour time across the screen, the date, and when the next alarm rings. There is always a
+// time: an estimate says so under the date, and a time lost with the power is grey with one line asking for Wi-Fi.
+const char *const kDayNames[2][7] = {{"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"},
+                                     {"DIMANCHE", "LUNDI", "MARDI", "MERCREDI", "JEUDI", "VENDREDI", "SAMEDI"}};
+const char *const kMonthNames[2][12] = {{"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"},
+                                        {"JANV", "FEVR", "MARS", "AVR", "MAI", "JUIN", "JUIL", "AOUT", "SEPT", "OCT", "NOV", "DEC"}};
+
+String font0Cp437Text(const String &text);
+// Centred, with accents (É in ESTIMÉ): Font0 draws CP437, one byte a letter.
+void centerFont0(const String &text, int y, uint8_t size, uint16_t colour, uint16_t background) { centerText(font0Cp437Text(text), y, size, colour, background); }
+
 void drawIdleClock() {
   auto &display = uiCanvas; display.fillScreen(TFT_BLACK);
   struct tm now{};
-  if (!wallClock(now)) return;
+  if (!wallClock(now)) { centerText("--:--", 6, 7, TFT_DARKGREY, TFT_BLACK); return; }
+  const clocktrust::Tier tier = clockTier();
   const bool night = clockapps::isBedtime(now.tm_hour);
   char text[40];
   snprintf(text, sizeof(text), "%02d:%02d", now.tm_hour, now.tm_min);
-  centerText(text, 6, 7, night ? TFT_ORANGE : TFT_WHITE, TFT_BLACK);
-  static const char *const kDays[2][7] = {{"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"},
-                                          {"DIMANCHE", "LUNDI", "MARDI", "MERCREDI", "JEUDI", "VENDREDI", "SAMEDI"}};
-  static const char *const kMonths[2][12] = {{"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"},
-                                             {"JANV", "FEVR", "MARS", "AVR", "MAI", "JUIN", "JUIL", "AOUT", "SEPT", "OCT", "NOV", "DEC"}};
+  centerText(text, 6, 7, tier == clocktrust::Tier::Unknown ? TFT_DARKGREY : night ? TFT_ORANGE : TFT_WHITE, TFT_BLACK);
   const int language = frenchUi ? 1 : 0;
-  snprintf(text, sizeof(text), "%s %d %s", kDays[language][now.tm_wday], now.tm_mday, kMonths[language][now.tm_mon]);
+  if (tier == clocktrust::Tier::Unknown) {
+    // The guess is behind by however long the device was off: no date, no alarm countdown by it.
+    centerText(uiText("TIME UNKNOWN", "HEURE INCONNUE"), 70, 2, TFT_ORANGE, TFT_BLACK);
+    centerText(uiText("CONNECT TO WI-FI", "CONNECTE LE WI-FI"), 94, 2, TFT_WHITE, TFT_BLACK);
+    if (alarms.minutesUntil(now.tm_wday, now.tm_hour, now.tm_min) >= 0)
+      centerText(uiText("ALARMS RING ONCE IT IS SET", "LES REVEILS SONNERONT APRES"), 112, 1, TFT_DARKGREY, TFT_BLACK);
+    return;
+  }
+  snprintf(text, sizeof(text), "%s %d %s", kDayNames[language][now.tm_wday], now.tm_mday, kMonthNames[language][now.tm_mon]);
   centerText(text, 70, 2, TFT_DARKGREY, TFT_BLACK);
+  const bool estimated = tier == clocktrust::Tier::Estimated;
+  if (estimated) centerFont0(uiText("ESTIMATED", "ESTIMÉ"), 86, 1, TFT_YELLOW, TFT_BLACK);
   int next = -1;
   const int32_t minutes = alarms.minutesUntil(now.tm_wday, now.tm_hour, now.tm_min, &next);
   if (alarms.snoozed) {
     centerText(uiText("ALARM SNOOZED", "REVEIL REPORTE"), 94, 2, TFT_YELLOW, TFT_BLACK);
   } else if (minutes >= 0 && next >= 0) {
     const clockapps::AlarmEntry &entry = alarms.entries[next];
-    snprintf(text, sizeof(text), "%s %02u:%02u", uiText("ALARM", "REVEIL"), entry.hour, entry.minute);
+    snprintf(text, sizeof(text), "%s %s%02u:%02u", uiText("ALARM", "REVEIL"), estimated ? "~" : "", entry.hour, entry.minute);
     centerText(text, 94, 2, night ? TFT_DARKGREEN : TFT_GREEN, TFT_BLACK);
     // Within a day, how long; further off, which day.
-    if (minutes >= 1440) snprintf(text, sizeof(text), "%s", kDays[language][(now.tm_wday + (now.tm_hour * 60 + now.tm_min + minutes) / 1440) % 7]);
+    if (minutes >= 1440) snprintf(text, sizeof(text), "%s", kDayNames[language][(now.tm_wday + (now.tm_hour * 60 + now.tm_min + minutes) / 1440) % 7]);
     else if (minutes >= 60) snprintf(text, sizeof(text), "%s%d H %02d MIN", uiText("IN ", "DANS "), static_cast<int>(minutes / 60), static_cast<int>(minutes % 60));
     else snprintf(text, sizeof(text), "%s%d MIN", uiText("IN ", "DANS "), static_cast<int>(minutes));
     centerText(text, 112, 1, TFT_DARKGREY, TFT_BLACK);
@@ -3464,7 +3597,7 @@ void drawIdleClock() {
 
 // It takes over from any screen but the walkie, the hunt and charging, once the clock is set.
 bool idleClockAllowed() {
-  if (!clockFromNtp || ringingNow() != Ringing::None || voiceRecording || spacePttHeld) return false;
+  if (ringingNow() != Ringing::None || voiceRecording || spacePttHeld) return false;
   return screenMode != ScreenMode::Walkie && screenMode != ScreenMode::VoiceMessages && screenMode != ScreenMode::FoxFinding &&
          screenMode != ScreenMode::Charging && screenMode != ScreenMode::ChargingConfirm;
 }
@@ -3500,6 +3633,7 @@ bool sleepAllowed() {
 
 void enterSleep() {
   sleeping = true;
+  markClockNow();  // The chip keeps counting asleep; if the battery runs out, this is the last time known.
   Serial.println("SLEEP entered");
   sleepRadioOff = true;
   for (const uint32_t started = millis(); !radioIsOff && millis() - started < 5000;) delay(20);
@@ -3529,7 +3663,7 @@ uint32_t sleepWakeInMs() {
   if (timerCountdown.state == clockapps::Countdown::State::Running) wake = std::min(wake, std::max<uint32_t>(timerCountdown.leftMs(now), 1));
   if (alarms.snoozed) wake = std::min(wake, clockapps::reached(now, alarms.snoozeUntil) ? 1u : alarms.snoozeUntil - now);
   struct tm wall{};
-  if (wallClock(wall)) {
+  if (alarmClock(wall)) {
     const int32_t minutes = alarms.minutesUntil(wall.tm_wday, wall.tm_hour, wall.tm_min);
     if (minutes > 0) {
       // Half a second into the alarm's minute, so the minute check sees it at once.
@@ -3596,7 +3730,7 @@ void drawRinging() {
   const Ringing what = ringingNow();
   if (what == Ringing::Alarm) {
     centerText(uiText("ALARM", "REVEIL"), 8, 3, colour, background);
-    centerText(ringingAlarmText(), 40, 4, colour, background);
+    centerText(String(clockTier() == clocktrust::Tier::Estimated ? "~" : "") + ringingAlarmText(), 40, 4, colour, background);
     centerText(uiText("ENTER = STOP", "ENTER = ARRET"), 86, 2, colour, background);
     centerText(uiText("OTHER KEY: SNOOZE", "AUTRE: DANS 5 MIN"), 108, 2, colour, background);
     return;
@@ -3617,6 +3751,7 @@ void startRinging() {
   const uint32_t now = millis();
   // Charging mode has the speaker off and the screen dim; an alert brings the device back.
   if (chargingModeActive) exitChargingMode();
+  stopMorningAudio();  // A snooze ringing again ends the overview's sound.
   if (media::active() && alarmSong == AlarmSong::None) stopMediaNow();
   if (audioPlaying) stopVoicePlayback();
   sleepTimer.cancel();
@@ -3630,12 +3765,15 @@ void startRinging() {
 
 void dismissRinging(bool stop) {
   const Ringing what = ringingNow();
+  const int alarmHour = what == Ringing::Alarm && alarms.ringing >= 0 && alarms.ringing < alarms.count ? alarms.entries[alarms.ringing].hour : -1;
   if (what == Ringing::Alarm) { alarmRinging = false; if (!stop) alarms.snooze(millis()); stopAlarmSong(); }
   else if (what == Ringing::ScreenTime) screenTime.countdown.reset();
   else if (what == Ringing::Timer) timerCountdown.reset();
   M5Cardputer.Speaker.stop(0);
   if (ringingNow() != Ringing::None) startRinging();
   Serial.printf("CLOCK dismissed %d %s\n", static_cast<int>(what), stop ? "stop" : "snooze");
+  // A morning alarm's first snooze or stop of the day opens the Morning Overview.
+  if (alarmHour >= 0 && ringingNow() == Ringing::None) morningAfterAlarm(static_cast<uint8_t>(alarmHour));
   renderDirty = true;
 }
 
@@ -3675,7 +3813,7 @@ void serviceClockApps() {
   if (now - lastAlarmCheckAt >= 1000) {
     lastAlarmCheckAt = now;
     struct tm wall{};
-    if (wallClock(wall) && alarms.due(wall.tm_wday, wall.tm_yday, wall.tm_hour, wall.tm_min)) { alarmRinging = true; ring = true; }
+    if (alarmClock(wall) && alarms.due(wall.tm_wday, wall.tm_yday, wall.tm_hour, wall.tm_min)) { alarmRinging = true; ring = true; }
   }
   if (ring) startRinging();
   if (warning != clockapps::Warning::None && !ring) {
@@ -3848,6 +3986,7 @@ void render() {
   else if (idleClockShown) drawIdleClock();
   else if (screenMode == ScreenMode::Timer) drawTimer(); else if (screenMode == ScreenMode::Alarm) drawAlarm();
   else if (screenMode == ScreenMode::ScreenTime) drawScreenTime(); else if (screenMode == ScreenMode::Stopwatch) drawStopwatch();
+  else if (screenMode == ScreenMode::Morning) drawMorning(); else if (screenMode == ScreenMode::Agenda) drawAgenda();
   else if (screenMode == ScreenMode::Chat) drawChat(); else if (screenMode == ScreenMode::Menu) drawMenu(); else if (screenMode == ScreenMode::Rooms) drawRooms();
   else if (screenMode == ScreenMode::Volume) drawVolume(); else if (screenMode == ScreenMode::Language) drawLanguage(); else if (screenMode == ScreenMode::Changelog) drawChangelog();
   else if (screenMode == ScreenMode::EmojiRecipes) drawEmojiRecipes();
@@ -4381,7 +4520,7 @@ void shrinkChatForPlayback() {
 // A book started or resumed at bedtime gets a sleep timer, unless one is already running.
 void armBedtimeSleep() {
   struct tm wall{};
-  if (sleepTimer.on || queueCollection != library::Collection::Books || !wallClock(wall) || !clockapps::isBedtime(wall.tm_hour)) return;
+  if (sleepTimer.on || queueCollection != library::Collection::Books || !ruleClock(wall) || !clockapps::isBedtime(wall.tm_hour)) return;
   sleepTimer.set(millis(), clockapps::kBedtimeSleepMs);
   Serial.println("SLEEP bedtime timer 30 min");
 }
@@ -4412,7 +4551,7 @@ void serviceSchoolNight() {
   lastSchoolNightCheckAt = now;
   if (queueCollection != library::Collection::Books || media::state() != media::State::Playing || alarmSong != AlarmSong::None) return;
   struct tm wall{};
-  if (!wallClock(wall)) return;
+  if (!ruleClock(wall)) return;  // An unknown clock never stops a book (README, Design principles).
   const uint32_t stopIn = clockapps::schoolNightStopInMs(wall.tm_wday, wall.tm_hour, wall.tm_min, wall.tm_sec);
   if (!stopIn) return;
   if (!sleepTimer.on || sleepTimer.leftMs(now) > stopIn) { sleepTimer.set(now, stopIn); renderDirty = true; }
@@ -4535,6 +4674,389 @@ void serviceAlarmSong() {
   else if (now - alarmSongAt > kAlarmSongStartMs) failAlarmSong("song never started");
 }
 
+// ---- Morning Overview (docs/morning-overview.md, part B) ----
+// After the first snooze or stop of a morning alarm: the day's brief, spoken (Piper, rendered on paqman) and
+// written, and an AGENDA to re-read. Both languages are on the card, so LANGUAGE works offline. With no brief
+// the screens still show the date (by the clock's tier), the alarms and the school-night stop.
+struct MorningEvent { String time; String text[2]; };
+struct MorningBrief {
+  bool loaded = false;
+  String date, version;
+  String weather[2], speech[2];
+  uint16_t audioSeconds[2] = {0, 0};
+  std::vector<MorningEvent> events;
+};
+MorningBrief morningBrief;
+morning::Trigger morningTrigger;
+enum class MorningAudio : uint8_t { None, Starting, Playing };
+MorningAudio morningAudio = MorningAudio::None;
+uint32_t morningAudioAt = 0;
+String morningAudioFile;
+const char *morningAudioNote = "";
+int morningScroll = 0;
+int agendaScroll = 0;
+volatile bool morningReload = true;     // The network task got a new brief: the loop reads it again.
+volatile bool morningFetchNow = true;   // Fetch at the first chance after boot.
+uint32_t lastMorningFetchAt = 0;
+constexpr uint32_t kMorningFetchEveryMs = 30 * 60000u;
+constexpr char kMorningFolder[] = "/morning";
+constexpr char kMorningIndex[] = "/morning/index.txt";  // The dates on the card, one a line: no folder walk.
+constexpr int kMorningLines = 4;      // Font0 x2 lines between the date and the status line
+constexpr int kMorningLineChars = 19;
+
+int morningLanguage() { return frenchUi ? 0 : 1; }
+const char *morningLanguageCode() { return frenchUi ? "fr" : "en"; }
+String morningAudioPath(const String &date, const char *language) { return String(kMorningFolder) + "/" + date + "." + language + ".mp3"; }
+
+// Today as YYYY-MM-DD, or empty when the clock is unknown (a guess after a power loss can be days off).
+String morningToday() {
+  struct tm now{};
+  if (clockTier() == clocktrust::Tier::Unknown || !wallClock(now)) return "";
+  char text[12];
+  snprintf(text, sizeof(text), "%04d-%02d-%02d", now.tm_year + 1900, now.tm_mon + 1, now.tm_mday);
+  return text;
+}
+
+std::vector<std::string> readMorningIndex() {
+  std::vector<std::string> dates;
+  if (!sdReady) return dates;
+  File index = SD.open(kMorningIndex, FILE_READ);
+  if (!index) return dates;
+  while (index.available() && dates.size() < 16) {
+    const String line = index.readStringUntil('\n');
+    if (line.length() >= 10) dates.push_back(std::string(line.c_str(), 10));
+  }
+  index.close();
+  return dates;
+}
+
+bool parseMorningBrief(const String &json, MorningBrief &brief) {
+  JsonDocument document;
+  if (deserializeJson(document, json)) return false;
+  brief = MorningBrief();
+  brief.date = String(document["date"] | ""); brief.version = String(document["version"] | "");
+  if (brief.date.length() != 10) return false;
+  const char *const languages[2] = {"fr", "en"};
+  for (int language = 0; language < 2; language++) {
+    JsonObjectConst part = document[languages[language]].as<JsonObjectConst>();
+    brief.weather[language] = String(part["weather"] | ""); brief.speech[language] = String(part["speech"] | "");
+    brief.audioSeconds[language] = part["audio_s"] | 0;
+  }
+  for (JsonObjectConst event : document["events"].as<JsonArrayConst>()) {
+    if (brief.events.size() >= 12) break;
+    MorningEvent item; item.time = String(event["time"] | "");
+    item.text[0] = String(event["fr"] | ""); item.text[1] = String(event["en"] | "");
+    brief.events.push_back(item);
+  }
+  brief.loaded = true;
+  return true;
+}
+
+// The brief to show: today's, else the newest before it, else the newest of all when the date is unknown.
+void loadMorningBrief() {
+  morningBrief = MorningBrief();
+  const std::vector<std::string> dates = readMorningIndex();
+  const String today = morningToday();
+  const int pick = morning::pickBrief(dates, today.length() ? today.c_str() : nullptr);
+  if (pick < 0) return;
+  File file = SD.open(String(kMorningFolder) + "/" + dates[pick].c_str() + ".json", FILE_READ);
+  if (!file) return;
+  String json; json.reserve(file.size() + 1);
+  while (file.available()) json += static_cast<char>(file.read());
+  file.close();
+  if (!parseMorningBrief(json, morningBrief)) { morningBrief = MorningBrief(); Serial.printf("MORNING brief %s unreadable\n", dates[pick].c_str()); return; }
+  Serial.printf("MORNING brief %s (%s) loaded, today %s\n", morningBrief.date.c_str(), morningBrief.version.c_str(), today.length() ? today.c_str() : "unknown");
+}
+
+void stopMorningAudio() {
+  if (morningAudio == MorningAudio::None) return;
+  if (media::active()) { media::stop(); waitForPlayerIdle(); }
+  morningAudio = MorningAudio::None; mediaStarting = false;
+  M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  renderDirty = true;
+  Serial.println("MORNING audio stopped");
+}
+
+// Asks for the player's task and the radio's RAM, as the alarm's song does; serviceMorningAudio plays it.
+void startMorningAudio() {
+  morningAudioNote = "";
+  if (!morningBrief.loaded) { morningAudioNote = uiText("NO REPORT YET: NEEDS WI-FI", "PAS ENCORE DE BULLETIN: WI-FI"); return; }
+  morningAudioFile = morningAudioPath(morningBrief.date, morningLanguageCode());
+  if (!sdReady || !SD.exists(morningAudioFile)) { morningAudioNote = uiText("NO SOUND ON THE CARD", "PAS DE SON SUR LA CARTE"); return; }
+  if (alarmSong != AlarmSong::None) stopAlarmSong();
+  if (media::active()) stopMediaNow();
+  os::setMediaOwner(os::Owner::Music); playingOwner = os::Owner::Music;
+  morningAudio = MorningAudio::Starting; morningAudioAt = millis();
+  mediaStarting = true; radioOffWanted = true; lastCardMediaAt = millis();
+  startMediaTasks();
+  renderDirty = true;
+  Serial.printf("MORNING audio starting %s\n", morningAudioFile.c_str());
+}
+
+void serviceMorningAudio() {
+  if (morningAudio == MorningAudio::None) return;
+  const uint32_t now = millis();
+  if (morningAudio == MorningAudio::Starting) {
+    if (mediaTasksWanted || !radioIsOff) {
+      if (now - morningAudioAt > kAlarmSongStartMs) { morningAudioNote = uiText("SOUND DID NOT START", "LE SON N'A PAS DEMARRE"); stopMorningAudio(); }
+      return;
+    }
+    M5Cardputer.Mic.end(); M5Cardputer.Speaker.begin();
+    // At least the middle step, as an alarm: the kid just woke up and the volume may be at 0 from last night.
+    M5Cardputer.Speaker.setVolume(kVolumeValues[std::max<uint8_t>(volumeLevel, 2)]); M5Cardputer.Speaker.setChannelVolume(0, 255);
+    shrinkChatForPlayback();
+    media::playFile(morningAudioFile, 0);
+    morningAudio = MorningAudio::Playing; morningAudioAt = now; mediaStarting = false;
+    Serial.println("MORNING audio playing");
+    renderDirty = true; return;
+  }
+  const auto state = media::state();
+  if (state == media::State::Playing || state == media::State::Paused) { lastCardMediaAt = now; if (now - lastRenderAt >= 500) renderDirty = true; return; }
+  if (state == media::State::Connecting && now - morningAudioAt < kAlarmSongStartMs) return;
+  if (state == media::State::Failed) morningAudioNote = media::failure();
+  stopMorningAudio();
+}
+
+// The first snooze or stop of a morning alarm, once a day: the overview, spoken the first time.
+void morningAfterAlarm(uint8_t alarmHour) {
+  struct tm now{};
+  if (!wallClock(now)) return;
+  const morning::Action action = morning::onAlarmHandled(morningTrigger, static_cast<int16_t>(now.tm_yday), alarmHour);
+  Serial.printf("MORNING after alarm %02u:xx open=%d play=%d\n", alarmHour, action.open, action.play);
+  if (!action.open) return;
+  loadMorningBrief();
+  setIdleClock(false);
+  screenMode = ScreenMode::Morning; morningScroll = 0; agendaScroll = 0; renderDirty = true;
+  if (action.play) startMorningAudio();
+}
+
+// The date line both screens share, by the clock's tier: a brief from another day says whose day it is.
+void drawMorningDate(int y) {
+  auto &display = uiCanvas;
+  const int language = frenchUi ? 1 : 0;
+  const clocktrust::Tier tier = clockTier();
+  const String today = morningToday();
+  display.setTextSize(1); display.setCursor(6, y);
+  struct tm now{};
+  if (tier == clocktrust::Tier::Unknown || !wallClock(now)) {
+    display.setTextColor(TFT_ORANGE, TFT_BLACK); display.print(uiText("DATE UNKNOWN: NEEDS WI-FI", "DATE INCONNUE: IL FAUT LE WI-FI"));
+  } else {
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.printf("%s %d %s", kDayNames[language][now.tm_wday], now.tm_mday, kMonthNames[language][now.tm_mon]);
+    if (tier == clocktrust::Tier::Estimated) { display.setTextColor(TFT_YELLOW, TFT_BLACK); display.print(" "); printFont0Text(uiText("(ESTIMATED)", "(ESTIMÉ)")); }
+  }
+  if (morningBrief.loaded && morningBrief.date != today) {
+    // An older brief (no Wi-Fi since), or any brief when the date is unknown: its own date, so nobody
+    // takes yesterday's weather for today's.
+    int year = 0, month = 0, day = 0;
+    sscanf(morningBrief.date.c_str(), "%d-%d-%d", &year, &month, &day);
+    display.setTextColor(TFT_YELLOW, TFT_BLACK); display.setCursor(6, y + 10);
+    display.printf("%s %d %s", uiText("REPORT OF", "BULLETIN DU"), day, month >= 1 && month <= 12 ? kMonthNames[language][month - 1] : "?");
+  }
+}
+
+void wrapInto(const String &text, uint16_t colour, std::vector<String> &lines, std::vector<uint16_t> &colours) {
+  for (const morning::Range &range : morning::wrap(text.c_str(), kMorningLineChars)) {
+    lines.push_back(text.substring(range.start, range.end)); colours.push_back(colour);
+  }
+}
+
+// The text the kid hears, or what the device knows by itself when no brief has come.
+void morningTextLines(std::vector<String> &lines, std::vector<uint16_t> &colours) {
+  const int language = morningLanguage();
+  if (morningBrief.loaded && morningBrief.speech[language].length()) { wrapInto(morningBrief.speech[language], TFT_WHITE, lines, colours); return; }
+  wrapInto(uiText("No morning report on the card yet. It comes over Wi-Fi.", "Pas encore de bulletin sur la carte. Il arrive par le Wi-Fi."), TFT_DARKGREY, lines, colours);
+}
+
+// The day's events, the weather note first, then what the device knows itself: today's alarms that are
+// still to ring and, on a school night, the book stop.
+void agendaLines(std::vector<String> &lines, std::vector<uint16_t> &colours) {
+  const int language = morningLanguage();
+  if (morningBrief.loaded && morningBrief.weather[language].length()) wrapInto(morningBrief.weather[language], TFT_CYAN, lines, colours);
+  if (morningBrief.loaded)
+    for (const MorningEvent &event : morningBrief.events) {
+      const String &text = event.text[language].length() ? event.text[language] : event.text[1 - language];
+      wrapInto(event.time.length() ? event.time + " " + text : text, TFT_WHITE, lines, colours);
+    }
+  struct tm now{};
+  if (alarmClock(now)) {
+    const bool weekend = now.tm_wday == 0 || now.tm_wday == 6;
+    for (int row = 0; row < alarms.count; row++) {
+      const clockapps::AlarmEntry &entry = alarms.entries[row];
+      if (!(weekend ? entry.weekends : entry.weekdays) || entry.hour * 60 + entry.minute <= now.tm_hour * 60 + now.tm_min) continue;
+      char text[32]; snprintf(text, sizeof(text), "%02u:%02u %s", entry.hour, entry.minute, uiText("Alarm", "Réveil"));
+      wrapInto(text, TFT_GREEN, lines, colours);
+    }
+    if (kSchoolNightRules && clockapps::schoolNightStopInMs(now.tm_wday, 21, 20, 0) > 0)
+      wrapInto(uiText("21:30 Book stops (school night)", "21:30 Livre arrêté (soir d'école)"), TFT_ORANGE, lines, colours);
+  }
+  if (lines.empty()) wrapInto(uiText("Nothing on the agenda.", "Rien à l'agenda."), TFT_DARKGREY, lines, colours);
+}
+
+void drawMorning() {
+  auto &display = uiCanvas; display.fillScreen(TFT_BLACK); drawHeader(uiText("MORNING", "BONJOUR"));
+  drawMorningDate(23);
+  std::vector<String> lines; std::vector<uint16_t> colours;
+  morningTextLines(lines, colours);
+  const int top = morningBrief.loaded && morningBrief.date != morningToday() ? 44 : 38;
+  const int rows = top == 44 ? kMorningLines - 1 : kMorningLines;
+  morningScroll = std::max(0, std::min(morningScroll, std::max(0, static_cast<int>(lines.size()) - rows)));
+  auto &canvas = uiCanvas; canvas.setTextSize(2);
+  for (int row = 0; row < rows && morningScroll + row < static_cast<int>(lines.size()); row++) {
+    canvas.setTextColor(colours[morningScroll + row], TFT_BLACK); canvas.setCursor(6, top + row * 17); printFont0Text(lines[morningScroll + row]);
+  }
+  canvas.setTextSize(1);
+  // The line above the keys: the sound, or where in the text.
+  display.setCursor(6, 112);
+  if (morningAudio == MorningAudio::Playing) {
+    const unsigned position = media::positionSeconds(), length = morningBrief.audioSeconds[morningLanguage()];
+    display.setTextColor(TFT_GREEN, TFT_BLACK);
+    display.printf("%s %u:%02u / %u:%02u", uiText("PLAYING", "LECTURE"), position / 60, position % 60, length / 60, length % 60);
+  } else if (morningAudio == MorningAudio::Starting) {
+    display.setTextColor(TFT_GREEN, TFT_BLACK); display.print(uiText("STARTING...", "DEMARRAGE..."));
+  } else if (*morningAudioNote) {
+    display.setTextColor(TFT_ORANGE, TFT_BLACK); printFont0Text(morningAudioNote);
+  } else {
+    display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    display.printf("%s %d-%d/%d", uiText("LINES", "LIGNES"), lines.empty() ? 0 : morningScroll + 1, std::min(morningScroll + rows, static_cast<int>(lines.size())), static_cast<int>(lines.size()));
+  }
+  display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(3, 123);
+  display.print(morningAudio == MorningAudio::None ? uiText("UP/DOWN READ ENTER PLAY RIGHT AGENDA", "HAUT/BAS LIRE ENTER JOUER DROITE AGENDA")
+                                                   : uiText("UP/DOWN READ ENTER STOP RIGHT AGENDA", "HAUT/BAS LIRE ENTER ARRET DROITE AGENDA"));
+}
+
+void drawAgenda() {
+  auto &display = uiCanvas; display.fillScreen(TFT_BLACK); drawHeader("AGENDA");
+  drawMorningDate(23);
+  std::vector<String> lines; std::vector<uint16_t> colours;
+  agendaLines(lines, colours);
+  const int top = morningBrief.loaded && morningBrief.date != morningToday() ? 44 : 38;
+  const int rows = top == 44 ? kMorningLines - 1 : kMorningLines;
+  agendaScroll = std::max(0, std::min(agendaScroll, std::max(0, static_cast<int>(lines.size()) - rows)));
+  display.setTextSize(2);
+  for (int row = 0; row < rows && agendaScroll + row < static_cast<int>(lines.size()); row++) {
+    display.setTextColor(colours[agendaScroll + row], TFT_BLACK); display.setCursor(6, top + row * 17); printFont0Text(lines[agendaScroll + row]);
+  }
+  display.setTextSize(1); display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 112);
+  display.printf("%s %d-%d/%d", uiText("LINES", "LIGNES"), lines.empty() ? 0 : agendaScroll + 1, std::min(agendaScroll + rows, static_cast<int>(lines.size())), static_cast<int>(lines.size()));
+  display.setCursor(6, 123); display.print(uiText("UP/DOWN READ   LEFT MORNING", "HAUT/BAS LIRE  GAUCHE BONJOUR"));
+}
+
+bool goBackFromApp();
+bool handleMorningKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown, bool goLeft, bool goRight) {
+  int &scroll = screenMode == ScreenMode::Morning ? morningScroll : agendaScroll;
+  if (goUp) { if (scroll > 0) scroll--; else { playDeniedTone(); return false; } }
+  else if (goDown) scroll++;  // drawn clamped
+  else if (screenMode == ScreenMode::Morning && goRight) { screenMode = ScreenMode::Agenda; agendaScroll = 0; }
+  else if (screenMode == ScreenMode::Agenda && goLeft) { screenMode = ScreenMode::Morning; }
+  else if (screenMode == ScreenMode::Morning && goLeft) { goBackFromApp(); }
+  else if (screenMode == ScreenMode::Morning && keys.enter) { if (morningAudio == MorningAudio::None) startMorningAudio(); else stopMorningAudio(); }
+  else return false;
+  renderDirty = true; return true;
+}
+
+// On the network task, while on Wi-Fi with nothing playing: today's and tomorrow's briefs onto the card.
+bool downloadToCard(const String &path, const String &file, int expectedBytes) {
+  const os::SecureLease lease(os::Priority::Background);
+  if (!lease.held) return false;
+  WiFiClientSecure client;
+  if (!openServer(client, kSecureConnectTimeoutMs)) return false;
+  HTTPClient http; http.setTimeout(35000); http.setReuse(false);
+  if (!http.begin(client, String(kApiBase) + path)) return false;
+  http.addHeader("Authorization", "Bearer " + deviceToken);
+  const int status = http.GET(); const int length = http.getSize();
+  if (status != 200 || length <= 0 || length > 700000 || (expectedBytes > 0 && length != expectedBytes)) {
+    Serial.printf("MORNING fetch %s status=%d length=%d want=%d\n", path.c_str(), status, length, expectedBytes); http.end(); return false;
+  }
+  const String temporary = file + ".part";
+  SD.remove(temporary);
+  File out = SD.open(temporary, FILE_WRITE);
+  if (!out) { http.end(); return false; }
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t buffer[1024];
+  int remaining = length;
+  os::Pacer pacer;
+  uint32_t lastByteAt = millis();
+  while (remaining > 0 && millis() - lastByteAt < 15000) {
+    const int ready = stream->available();
+    if (ready <= 0) { if (!client.connected()) break; vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+    const int got = stream->readBytes(buffer, std::min<int>(std::min<int>(ready, sizeof(buffer)), remaining));
+    if (got <= 0) continue;
+    if (out.write(buffer, got) != static_cast<size_t>(got)) break;
+    remaining -= got; lastByteAt = millis();
+    pacer.step();
+  }
+  out.close(); http.end();
+  if (remaining != 0) { SD.remove(temporary); Serial.printf("MORNING fetch %s cut short, %d left\n", path.c_str(), remaining); return false; }
+  SD.remove(file);
+  return SD.rename(temporary, file);
+}
+
+void serviceMorningDownload() {
+  if (!sdReady || !initialSyncComplete || chargingModeActive || mediaOwnsRadio()) return;
+  if (!morningFetchNow && millis() - lastMorningFetchAt < kMorningFetchEveryMs) return;
+  morningFetchNow = false; lastMorningFetchAt = millis();
+  String response; int status = 0;
+  requestJson("/api/device/morning", "GET", "", response, status);
+  if (status != 200) { if (status != 404) Serial.printf("MORNING list status=%d\n", status); return; }
+  JsonDocument document;
+  if (deserializeJson(document, response)) return;
+  if (!SD.exists(kMorningFolder)) SD.mkdir(kMorningFolder);
+  std::vector<std::string> dates = readMorningIndex();
+  bool changed = false;
+  for (JsonObjectConst entry : document["briefs"].as<JsonArrayConst>()) {
+    const String date = String(entry["date"] | ""), version = String(entry["version"] | "");
+    if (date.length() != 10 || version.isEmpty()) continue;
+    const String jsonFile = String(kMorningFolder) + "/" + date + ".json";
+    // The stored copy is current when its version matches and both sounds are whole.
+    bool current = false;
+    {
+      File existing = SD.open(jsonFile, FILE_READ);
+      if (existing) {
+        String json; while (existing.available() && json.length() < 4200) json += static_cast<char>(existing.read());
+        existing.close();
+        MorningBrief stored;
+        current = parseMorningBrief(json, stored) && stored.version == version;
+        for (const char *language : {"fr", "en"}) {
+          const int bytes = entry[String(language) + "_bytes"] | 0;
+          File audio = SD.open(morningAudioPath(date, language), FILE_READ);
+          if (bytes > 0 && (!audio || static_cast<int>(audio.size()) != bytes)) current = false;
+          if (audio) audio.close();
+        }
+      }
+    }
+    if (current) continue;
+    bool whole = downloadToCard("/api/device/morning/" + date, jsonFile + ".new", 0);
+    for (const char *language : {"fr", "en"}) {
+      const int bytes = entry[String(language) + "_bytes"] | 0;
+      if (whole && bytes > 0) whole = downloadToCard("/api/device/morning/" + date + "/" + language + ".mp3", morningAudioPath(date, language), bytes);
+    }
+    // The text goes in last, so a brief on the card always has its sounds.
+    if (whole) { SD.remove(jsonFile); whole = SD.rename(jsonFile + ".new", jsonFile); }
+    Serial.printf("MORNING brief %s %s %s\n", date.c_str(), version.c_str(), whole ? "saved" : "failed");
+    if (!whole) { morningFetchNow = false; lastMorningFetchAt = millis() - kMorningFetchEveryMs + 5 * 60000u; continue; }  // again in 5 min
+    if (std::find(dates.begin(), dates.end(), std::string(date.c_str())) == dates.end()) dates.push_back(date.c_str());
+    changed = true;
+  }
+  // Three days kept: older briefs and their sounds go.
+  const String today = morningToday();
+  if (today.length()) {
+    for (auto date = dates.begin(); date != dates.end();) {
+      if (!morning::expired(date->c_str(), today.c_str())) { ++date; continue; }
+      SD.remove(String(kMorningFolder) + "/" + date->c_str() + ".json");
+      for (const char *language : {"fr", "en"}) SD.remove(morningAudioPath(date->c_str(), language));
+      date = dates.erase(date); changed = true;
+    }
+  }
+  if (!changed) return;
+  File index = SD.open(String(kMorningIndex) + ".new", FILE_WRITE);
+  if (!index) return;
+  for (const std::string &date : dates) index.printf("%s\n", date.c_str());
+  index.close();
+  SD.remove(kMorningIndex); SD.rename(String(kMorningIndex) + ".new", kMorningIndex);
+  morningReload = true;
+}
+
 void openLibraryList(LibraryView view, const String &title) {
   libraryView = view; libraryTitle = title; libraryItems.clear(); librarySelection = 0;
   screenMode = ScreenMode::Library; renderDirty = true;
@@ -4578,10 +5100,11 @@ void openHomeApp(int index) {
   else if (app == AppId::Alarm) { alarmTyped.clear(); alarmRow = 0; alarmColumn = AlarmColumn::Time; screenMode = ScreenMode::Alarm; }
   else if (app == AppId::Clock) {
     // The big clock on demand, as after two idle minutes: the first key brings HOME back.
-    if (!idleClockAllowed()) { homeNotice = uiText("CLOCK NOT SET YET", "HEURE PAS ENCORE REGLEE"); homeNoticeAt = millis(); homeNoticeGood = false; bumpHome(0); return; }
+    if (!idleClockAllowed()) { bumpHome(0); return; }
     setIdleClock(true); return;
   }
   else if (app == AppId::ScreenTime) screenMode = ScreenMode::ScreenTime;
+  else if (app == AppId::Agenda) { loadMorningBrief(); agendaScroll = 0; screenMode = ScreenMode::Agenda; }
   else if (app == AppId::Stopwatch) screenMode = ScreenMode::Stopwatch;
   else if (app == AppId::Wifi) {
     // Wi-Fi is off while local mode is on, and joining a network would have nowhere to go.
@@ -4614,6 +5137,8 @@ bool goBackFromApp() {
   if (screenMode == ScreenMode::Home) return true;
   if (screenMode == ScreenMode::KeyHelp) { screenMode = ScreenMode::Chat; return true; }
   if (screenMode == ScreenMode::Remote || screenMode == ScreenMode::System || isClockScreen()) { screenMode = ScreenMode::Home; return true; }
+  // The overview's sound plays on if the kid leaves it: Enter on the screen stops it.
+  if (screenMode == ScreenMode::Morning || screenMode == ScreenMode::Agenda) { screenMode = ScreenMode::Home; return true; }
   if (isSettingsScreen()) { leaveSettingsScreen(); return true; }
   if (screenMode == ScreenMode::LibrarySearch) { openMusicRoot(); return true; }
   if (screenMode == ScreenMode::NowPlaying) {
@@ -4741,7 +5266,7 @@ os::Owner frontApp() {
     case ScreenMode::Home: case ScreenMode::System: case ScreenMode::Remote:
     case ScreenMode::Networks: case ScreenMode::NetworkPassword: case ScreenMode::Volume: case ScreenMode::Status:
     case ScreenMode::Language: case ScreenMode::ChargingConfirm: case ScreenMode::Changelog:
-    case ScreenMode::Timer: case ScreenMode::Alarm: case ScreenMode::ScreenTime: case ScreenMode::Stopwatch: return os::Owner::Ui;
+    case ScreenMode::Timer: case ScreenMode::Alarm: case ScreenMode::ScreenTime: case ScreenMode::Stopwatch: case ScreenMode::Morning: case ScreenMode::Agenda: return os::Owner::Ui;
     case ScreenMode::Library: case ScreenMode::LibrarySearch: case ScreenMode::NowPlaying: return os::mediaOwner();
     default: return os::Owner::Chat;
   }
@@ -4828,6 +5353,7 @@ void serviceMedia() {
     else if (millis() - lastCardMediaAt > kRadioBackAfterMs) radioOffWanted = false;
   }
   if (alarmSong != AlarmSong::None) { serviceAlarmSong(); if (alarmSong == AlarmSong::Starting || alarmSong == AlarmSong::Playing) return; }
+  if (morningAudio != MorningAudio::None) { serviceMorningAudio(); if (morningAudio != MorningAudio::None) return; }
   const bool listHadItems = !libraryItems.empty();
   if (library::takeItems(libraryItems)) {
     // Choosing an alarm's song: the beeps come first.
@@ -4915,9 +5441,11 @@ bool handleAppKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown
   if (escape && (screenMode == ScreenMode::Chat || screenMode == ScreenMode::Menu)) { screenMode = ScreenMode::Home; playNextTone(); renderDirty = true; return true; }
   if (escape && isSettingsScreen()) { leaveSettingsScreen(); playNextTone(); renderDirty = true; return true; }
   const bool ownScreen = screenMode == ScreenMode::Home || screenMode == ScreenMode::Library || screenMode == ScreenMode::LibrarySearch ||
-                         screenMode == ScreenMode::NowPlaying || screenMode == ScreenMode::Remote || screenMode == ScreenMode::System || isClockScreen();
+                         screenMode == ScreenMode::NowPlaying || screenMode == ScreenMode::Remote || screenMode == ScreenMode::System || isClockScreen() ||
+                         screenMode == ScreenMode::Morning || screenMode == ScreenMode::Agenda;
   if (!ownScreen) return false;
   if (escape) { goBackFromApp(); playNextTone(); renderDirty = true; return true; }
+  if (screenMode == ScreenMode::Morning || screenMode == ScreenMode::Agenda) { if (handleMorningKeys(keys, goUp, goDown, goLeft, goRight)) playNextTone(); return true; }
   if (isClockScreen()) { if (handleClockKeys(keys, goUp, goDown, goLeft, goRight)) playNextTone(); renderDirty = true; return true; }
   if (screenMode == ScreenMode::Home) {
     const int page = homeSelection / kHomeAppsPerPage; const int slot = homeSelection % kHomeAppsPerPage;
@@ -5221,7 +5749,7 @@ void setup() {
   if (std::none_of(wifiProfiles.begin(), wifiProfiles.end(), [](const WifiProfile &profile) { return profile.ssid == SUPACHAT_HOME_SSID; }))
     rememberWifi(SUPACHAT_HOME_SSID, SUPACHAT_HOME_PSK);
 #endif
-  seedBuildTime();
+  startClock();
   M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
   sampleBattery(true);
   drawBootSplash();
@@ -5276,7 +5804,8 @@ static void loopBody() {
   if (serviceSleep()) return;
   M5Cardputer.update();
   if (M5Cardputer.BtnA.isPressed()) lastUserInputAt = millis();
-  sampleBattery(); handleKeyboard(); serviceFoxFinding(); serviceClockApps();
+  if (morningReload) { morningReload = false; loadMorningBrief(); renderDirty = true; }
+  serviceClockTrust(); sampleBattery(); handleKeyboard(); serviceFoxFinding(); serviceClockApps();
   if (ringingNow() != Ringing::None && M5Cardputer.BtnA.wasClicked()) {
     if (clockapps::reached(millis(), ringKeysFrom)) dismissRinging(true);
     delay(2); return;
