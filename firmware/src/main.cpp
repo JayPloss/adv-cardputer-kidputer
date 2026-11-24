@@ -4700,9 +4700,10 @@ const char *morningAudioNote = "";
 int morningScroll = 0;
 int agendaScroll = 0;
 volatile bool morningReload = true;     // The network task got a new brief: the loop reads it again.
-volatile bool morningFetchNow = true;   // Fetch at the first chance after boot.
+volatile bool morningFetchNow = true;   // Fetch at the first chance after the boot's first two minutes.
 uint32_t lastMorningFetchAt = 0;
 constexpr uint32_t kMorningFetchEveryMs = 30 * 60000u;
+constexpr uint32_t kMorningFirstFetchMs = 2 * 60000u;
 constexpr char kMorningFolder[] = "/morning";
 constexpr char kMorningIndex[] = "/morning/index.txt";  // The dates on the card, one a line: no folder walk.
 constexpr int kMorningLines = 4;      // Font0 x2 lines between the date and the status line
@@ -4999,6 +5000,8 @@ bool downloadToCard(const String &path, const String &file, int expectedBytes) {
 
 void serviceMorningDownload() {
   if (!sdReady || !initialSyncComplete || chargingModeActive || mediaOwnsRadio()) return;
+  // Not in the boot's burst of secure connections: chat catches up first (the cards keep yesterday's brief anyway).
+  if (millis() < kMorningFirstFetchMs) return;
   if (!morningFetchNow && millis() - lastMorningFetchAt < kMorningFetchEveryMs) return;
   morningFetchNow = false; lastMorningFetchAt = millis();
   // A handshake is about 1.5 s of software ECC on core 0: a tick between secure connections lets core 0's idle
