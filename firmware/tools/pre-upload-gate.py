@@ -35,6 +35,34 @@ def gate_key(repo, runtime):
     return digest.hexdigest()
 
 
+# Where the runtime emulator can't model a device function, the gate overrides it, and only there (Jay,
+# 2026-11-24). Each function's stand-in and the reason are in firmware/tools/not-emulated.h, which main.cpp
+# includes in the emulator's build only. Keep this list and that file in step. Every run prints this list as "not covered": those layers are proven on a device or not at all.
+NOT_EMULATED = {
+    "esp_reset_reason": "reset cause from the chip's RTC domain; the emulator's clock always equals world time, "
+                        "so a clock lost with the power (unknown tier, high-water mark) can't be shown",
+    "sntp_restart": "lwIP's SNTP client; the emulator answers the time at once, so the re-ask on a Wi-Fi rejoin "
+                    "and the drift it corrects aren't exercised",
+}
+# Scenarios skipped because what they check depends on a function above, and why.
+NOT_EMULATED_SCENARIOS = {
+    "book-sleep": "sntp_restart: its `clock` line moves the time with no time-server answer behind it; v0.66 trusts "
+                  "a clock for quiet-time rules only from an answer, so the bedtime timer is off there",
+    "school-night": "sntp_restart: same as book-sleep, for the 21:30 school-night stop",
+}
+
+
+def runtime_check_command(runtime):
+    """check.py with every scenario but the specific ones the list above overrides."""
+    command = ["python3", os.path.join(runtime, "tools", "check.py")]
+    if NOT_EMULATED_SCENARIOS:
+        import re
+        source = open(os.path.join(runtime, "tools", "check.py")).read()
+        names = re.findall(r"'([a-z0-9-]+)'", re.search(r"^ALL = \[(.*?)\]", source, re.M | re.S).group(1))
+        command += [name for name in names if name not in NOT_EMULATED_SCENARIOS]
+    return command
+
+
 def run_device_contract_gate(source, target, env):
     repo = os.path.abspath(os.path.join(env["PROJECT_DIR"], ".."))
     runtime = os.path.abspath(os.path.join(repo, "..", "cardputer-emulator"))
@@ -52,7 +80,12 @@ def run_device_contract_gate(source, target, env):
     # The runtime emulator, when it is checked out beside this repo: real firmware on a device-sized heap.
     # The power lab is its own program and has no scenarios.
     if os.path.isdir(runtime) and env["PIOENV"] != "power-lab":
-        checks.append(["python3", os.path.join(runtime, "tools", "check.py")])
+        checks.append(runtime_check_command(runtime))
+        print("Upload gate: not covered by the emulator (overridden, see firmware/tools/not-emulated.h):")
+        for name, why in NOT_EMULATED.items():
+            print(f"  - {name}: {why}")
+        for name, why in NOT_EMULATED_SCENARIOS.items():
+            print(f"  - scenario {name} skipped: {why}")
         # The real binary in QEMU: the tier that sees ESP-IDF startup, the real heap and newlib.
         checks.append(["bash", os.path.join(runtime, "qemu", "boot-check.sh"), env["PROJECT_DIR"]])
     for command in checks:

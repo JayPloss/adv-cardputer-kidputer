@@ -7,6 +7,10 @@
 #include "apps/time/clock_apps.h"
 #include "apps/time/clock_trust.h"
 #include "apps/time/morning.h"
+#ifdef EMU_HEAP_START
+// The runtime emulator's build only: stand-ins for the device functions it can't model (the list and why are there).
+#include "../tools/not-emulated.h"
+#endif
 #include "apps/chat/fox_finding.h"
 #include "apps/system/french_keyboard.h"
 #include "apps/chat/outbox.h"
@@ -4957,6 +4961,7 @@ bool handleMorningKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool go
 
 // On the network task, while on Wi-Fi with nothing playing: today's and tomorrow's briefs onto the card.
 bool downloadToCard(const String &path, const String &file, int expectedBytes) {
+  vTaskDelay(pdMS_TO_TICKS(20));  // between handshakes, as above
   const os::SecureLease lease(os::Priority::Background);
   if (!lease.held) return false;
   WiFiClientSecure client;
@@ -4996,6 +5001,9 @@ void serviceMorningDownload() {
   if (!sdReady || !initialSyncComplete || chargingModeActive || mediaOwnsRadio()) return;
   if (!morningFetchNow && millis() - lastMorningFetchAt < kMorningFetchEveryMs) return;
   morningFetchNow = false; lastMorningFetchAt = millis();
+  // A handshake is about 1.5 s of software ECC on core 0: a tick between secure connections lets core 0's idle
+  // task run, or a sync followed at once by this fetch starves the watchdog (runtime emulator, watchdog.scn).
+  vTaskDelay(pdMS_TO_TICKS(20));
   String response; int status = 0;
   requestJson("/api/device/morning", "GET", "", response, status);
   if (status != 200) { if (status != 404) Serial.printf("MORNING list status=%d\n", status); return; }
