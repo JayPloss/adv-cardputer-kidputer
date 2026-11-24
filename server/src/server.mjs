@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import QRCode from 'qrcode';
 import { handleParentControls, initParentControls } from './parent-controls.mjs';
+import { handleMorning, initMorning } from './morning.mjs';
 
 const sourceRoot = dirname(fileURLToPath(import.meta.url));
 const webRoot = join(sourceRoot, '..', 'web');
@@ -225,6 +226,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS device_preferences (
 )`);
 
 initParentControls(db);
+initMorning(db, config.dataDir);
 
 const seed = db.prepare('INSERT OR IGNORE INTO users(id, display_name, short_name, kind) VALUES (?, ?, ?, ?)');
 seed.run('papa', 'Papa', 'Papa', 'web');
@@ -841,6 +843,7 @@ const server = createServer(async (req, res) => {
     const user = actor(req);
     if (!user) return json(res, 401, { error: 'unauthorized' });
     touchPresence(user);
+    if (await handleMorning(req, res, url, user, { json, body, rawBody, webUser, deviceUser, sameOrigin })) return;
 
     if (url.pathname === '/api/session' && req.method === 'GET') {
       const profile = db.prepare('SELECT id, display_name, short_name, role, language_preference FROM users WHERE id = ?').get(user);

@@ -1,0 +1,11 @@
+[Unit]
+Description=Build and upload tomorrow's Kidputer morning briefs each evening
+
+[Timer]
+OnCalendar=*-*-* 20:30:00 America/Toronto
+# A missed run (paqman asleep or off at 20:30) runs at the next wake-up.
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

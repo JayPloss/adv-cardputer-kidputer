@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to ~/.config/kidputer/morning.json and fill in. user = SupaChat device user; name = first name in the greeting; lat/lon = the town, two decimals. Only lat/lon are sent to Open-Meteo. Real places stay out of this public repo.",
+  "kids": [
+    {"user": "kid-one", "name": "First", "lat": 45.50, "lon": -73.57},
+    {"user": "kid-two", "name": "Second", "lat": 45.50, "lon": -73.57}
+  ]
+}

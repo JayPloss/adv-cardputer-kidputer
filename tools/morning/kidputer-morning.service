@@ -1,0 +1,12 @@
+[Unit]
+Description=Kidputer morning briefs for tomorrow (weather + agenda, Piper voice) uploaded to SupaChat
+Documentation=file://%h/Work/adv-cardputer-kidputer/tools/morning/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# SUPACHAT_HUB_TOKEN=... (Papa's hub key), optionally SUPACHAT_URL=...; mode 600.
+EnvironmentFile=%h/.config/kidputer/morning.env
+ExecStart=/usr/bin/python3 -I %h/Work/adv-cardputer-kidputer/tools/morning/morning-brief.py
+Nice=10
