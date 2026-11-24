@@ -4816,7 +4816,8 @@ void serviceMorningAudio() {
     renderDirty = true; return;
   }
   const auto state = media::state();
-  if (state == media::State::Playing || state == media::State::Paused) { lastCardMediaAt = now; if (now - lastRenderAt >= 500) renderDirty = true; return; }
+  // Once a second for the position: drawing less leaves the decoder its time.
+  if (state == media::State::Playing || state == media::State::Paused) { lastCardMediaAt = now; if (now - lastRenderAt >= 1000) renderDirty = true; return; }
   if (state == media::State::Connecting && now - morningAudioAt < kAlarmSongStartMs) return;
   if (state == media::State::Failed) morningAudioNote = media::failure();
   stopMorningAudio();
@@ -4901,8 +4902,10 @@ void agendaLines(std::vector<String> &lines, std::vector<uint16_t> &colours) {
 void drawMorning() {
   auto &display = uiCanvas; display.fillScreen(TFT_BLACK); drawHeader(uiText("MORNING", "BONJOUR"));
   drawMorningDate(23);
-  std::vector<String> lines; std::vector<uint16_t> colours;
-  morningTextLines(lines, colours);
+  // Broken into lines once per brief and language, not on every frame while it plays.
+  static std::vector<String> lines; static std::vector<uint16_t> colours; static String linesFor;
+  const String key = morningBrief.version + morningBrief.date + (frenchUi ? "fr" : "en") + (morningBrief.loaded ? "1" : "0");
+  if (key != linesFor) { lines.clear(); colours.clear(); morningTextLines(lines, colours); linesFor = key; }
   const int top = morningBrief.loaded && morningBrief.date != morningToday() ? 44 : 38;
   const int rows = top == 44 ? kMorningLines - 1 : kMorningLines;
   morningScroll = std::max(0, std::min(morningScroll, std::max(0, static_cast<int>(lines.size()) - rows)));
