@@ -42,6 +42,8 @@ Each item says where it came from. Add to this list; don't delete from it unless
 
 - **The clock is seeded from the build time, so a plausible year proves nothing.** `ensureTime` used to call the clock synced when the year looked right, which the seed always makes true. Anything that acts on the time of day (the alarm) waits for SNTP's callback, `clockFromNtp` (2026-11-07).
 
+- **The chip's clock drifts in light sleep; an alarm rings by a corrected one.** The ADV has no 32 kHz crystal, so light sleep counts on the internal oscillator. Albie's 07:00 alarm rang at 06:30 (2026-11-25, cause unproven). Since v0.67 a sleeping device asks the time servers at 05:00 and 5 minutes before each alarm. Anything else that must happen at a time of day while asleep needs the same check, and the runtime emulator's `clock-drift` to test it.
+
 - **No PSRAM.** Lists and strings on a screen cost real heap beside the player: a 200-song list ran out of memory, and opening a card folder now stops playback for that reason (commit "whole library on the card").
 - **Keep drawing off the key path.** Rendering is throttled to about 20 fps so typing and tones stay responsive (README). A long flourish must be stepped by time in the loop, never with `delay()`.
 

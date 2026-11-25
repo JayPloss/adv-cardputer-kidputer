@@ -1663,6 +1663,18 @@ bool wifiWasJoined = false;  // The network task's: a new join asks the time ser
 // What the clock read just before, in the loop, to measure the drift a sync corrects.
 int64_t clockShadowUs = 0;
 uint32_t clockShadowMs = 0;
+// The chip's clock just before a time server's answer set it (sntp_sync_time below): the drift, measured.
+volatile int64_t clockBeforeSyncUs = 0;
+volatile bool clockBeforeSyncKnown = false;
+// What the last sync found, for STATUS and the log: drift (server minus chip), hours since the sync before,
+// and of those, hours spent in light sleep, which runs on the chip's internal oscillator.
+float lastDriftS = 0, lastDriftOverH = -1, lastDriftAsleepH = 0;
+bool lastDriftKnown = false;
+uint64_t asleepUsSinceSync = 0;   // light sleep since the last sync, by the chip's own count
+bool alarmCheckAsking = false;    // set while the pre-alarm check waits for a time server (serviceSleep)
+uint32_t clockSyncCount = 0;      // answers taken in, so a waiting check can tell one came
+const char *clockCheckWhy = "sync";  // what asked for the next answer, for the log: alarm-check, night-check
+volatile bool clockAskWanted = false;  // the network task asks the time servers again once joined
 
 int64_t clockNowUs() { timeval now{}; gettimeofday(&now, nullptr); return static_cast<int64_t>(now.tv_sec) * 1000000 + now.tv_usec; }
 int64_t clockNowS() { return clockNowUs() / 1000000; }
@@ -1681,6 +1693,16 @@ void saveClockState(bool includeBoot = false) {
 void onTimeSynced(struct timeval *value) {
   clockSyncAtUs = value ? static_cast<int64_t>(value->tv_sec) * 1000000 + value->tv_usec : clockNowUs();
   clockSyncAtMs = millis(); clockSyncArrived = true; clockFromNtp = true;
+}
+
+// Replaces ESP-IDF's weak sntp_sync_time (esp_sntp.h says to, to change how an answer is applied): the same
+// immediate set, with the chip's own reading taken just before, so each sync measures the drift exactly,
+// whatever millis() did in light sleep (it runs on the same oscillator there).
+extern "C" void sntp_sync_time(struct timeval *value) {
+  clockBeforeSyncUs = clockNowUs(); clockBeforeSyncKnown = true;
+  settimeofday(value, nullptr);
+  sntp_set_sync_status(SNTP_SYNC_STATUS_COMPLETED);
+  onTimeSynced(value);
 }
 
 // The clock is seeded from the build time, so a plausible year proves nothing: only SNTP's callback
@@ -1747,16 +1769,24 @@ void serviceClockTrust() {
     clockSyncArrived = false;
     const int64_t syncUs = clockSyncAtUs;
     const clocktrust::Tier was = clocktrust::tier(clockTrust, clockShadowUs / 1000000);
-    // Where the clock would be had the answer not come: the last reading plus the time since, by millis().
-    const int64_t expectedUs = clockShadowUs + static_cast<int64_t>(static_cast<int32_t>(clockSyncAtMs - clockShadowMs)) * 1000;
+    // The chip's reading just before the answer set it; without one (never on a device), the last loop
+    // reading plus the time since by millis().
+    const int64_t expectedUs = clockBeforeSyncKnown ? static_cast<int64_t>(clockBeforeSyncUs)
+                                                    : clockShadowUs + static_cast<int64_t>(static_cast<int32_t>(clockSyncAtMs - clockShadowMs)) * 1000;
+    clockBeforeSyncKnown = false;
     const double driftS = static_cast<double>(syncUs - expectedUs) / 1e6;
     const double sinceH = clockTrust.synced > 0 ? static_cast<double>(syncUs / 1000000 - clockTrust.synced) / 3600.0 : -1;
+    const double asleepH = static_cast<double>(asleepUsSinceSync) / 3.6e9;
+    lastDriftS = driftS; lastDriftOverH = sinceH; lastDriftAsleepH = asleepH; lastDriftKnown = true; asleepUsSinceSync = 0;
+    clockSyncCount++;
     static const char *const kTierNames[] = {"synced", "estimated", "unknown"};
-    Serial.printf("CLOCK sync drift %+.1f s after %.1f h, was %s\n", driftS, sinceH, kTierNames[static_cast<int>(was)]);
+    const char *why = clockCheckWhy; clockCheckWhy = "sync";
+    Serial.printf("CLOCK sync drift %+.1f s after %.1f h (%.1f h asleep), was %s, %s\n", driftS, sinceH, asleepH, kTierNames[static_cast<int>(was)], why);
     if (sdReady && !media::active() && !library::cardSyncRunning()) {
-      // utc_s,firmware,tier_before,hours_since_sync,drift_s: how far the chip's clock wanders, per device.
+      // utc_s,firmware,tier_before,hours_since_sync,drift_s,hours_asleep,why: how far the chip's clock wanders,
+      // per device. Drift is the server's time minus the chip's: negative means the chip ran fast.
       File log = SD.open("/supachat-clock.csv", FILE_APPEND);
-      if (log) { log.printf("%lld,%s,%s,%.1f,%.2f\n", static_cast<long long>(syncUs / 1000000), kFirmwareVersion, kTierNames[static_cast<int>(was)], sinceH, driftS); log.close(); }
+      if (log) { log.printf("%lld,%s,%s,%.1f,%.2f,%.2f,%s\n", static_cast<long long>(syncUs / 1000000), kFirmwareVersion, kTierNames[static_cast<int>(was)], sinceH, driftS, asleepH, why); log.close(); }
     }
     clocktrust::onSync(clockTrust, syncUs / 1000000);
     saveClockState(); lastClockMarkAt = nowMs; renderDirty = true;
@@ -2482,8 +2512,11 @@ void networkTask(void *) {
     if (os::boot() == os::Boot::Joining) os::setBoot(os::Boot::Syncing);
     const bool firstAsk = !ntpAttempted;
     ensureTime();
+    if (firstAsk) clockAskWanted = false;  // that was the ask
     // Back on Wi-Fi with a clock that isn't fresh: ask the time servers now, not at SNTP's next hourly poll.
-    if (!wifiWasJoined && !firstAsk && clockTier() != clocktrust::Tier::Synced) { Serial.println("CLOCK asking the time servers again"); sntp_restart(); }
+    if ((!wifiWasJoined && !firstAsk && clockTier() != clocktrust::Tier::Synced) || (clockAskWanted && !firstAsk)) {
+      clockAskWanted = false; Serial.println("CLOCK asking the time servers again"); sntp_restart();
+    }
     wifiWasJoined = true;
     if (localBlackout() && !syncOverride) {
       networkStatus = "BLACKOUT 22-06"; currentSsid = ""; renderDirty = true;
@@ -2901,6 +2934,9 @@ void drawStatus() {
     display.printf(frenchUi ? "APPAREIL  %s\n" : "NODE      %s\n", kDeviceName);
     display.printf("WIFI      %s\n", currentSsid.isEmpty() ? "offline" : currentSsid.get().c_str());
     display.printf(frenchUi ? "ETAT      %s\n" : "STATE     %s\n", networkStatus.get().c_str()); display.printf(frenchUi ? "HEURE     %s\n" : "TIME      %s\n", clockTier() == clocktrust::Tier::Synced ? uiText("synced", "a jour") : clockTier() == clocktrust::Tier::Estimated ? uiText("estimated", "estimee") : uiText("unknown", "inconnue"));
+    // What the last time server answer corrected: negative means the chip ran fast (v0.67).
+    if (lastDriftKnown) display.printf(frenchUi ? "DERIVE    %+.0fs %.1fh, %.1fh dodo\n" : "DRIFT     %+.0fs %.1fh, %.1fh asleep\n", lastDriftS, lastDriftOverH, lastDriftAsleepH);
+    else display.printf(frenchUi ? "DERIVE    -\n" : "DRIFT     -\n");
     display.printf(frenchUi ? "BATTERIE  %d%%  %d mV\n" : "BATTERY   %d%%  %d mV\n", batteryLevel, batteryVoltageMv);
     display.printf(frenchUi ? "ALIM.     %s\n" : "POWER     %s\n", externalPowerDetected ? uiText("cable detected", "cable detecte") : uiText("not detected", "non detecte"));
     display.printf("SD/KEY    %s / %s\n", sdReady ? "ready" : "missing", keyboardReady ? "ready" : "fault");
@@ -3702,12 +3738,12 @@ bool sleepAllowed() {
          screenTime.countdown.state != clockapps::Countdown::State::Running;
 }
 
+void radioOffForSleep();
 void enterSleep() {
   sleeping = true;
   markClockNow();  // The chip keeps counting asleep; if the battery runs out, this is the last time known.
   Serial.println("SLEEP entered");
-  sleepRadioOff = true;
-  for (const uint32_t started = millis(); !radioIsOff && millis() - started < 5000;) delay(20);
+  radioOffForSleep();
   M5Cardputer.Speaker.end();
   M5Cardputer.Display.setBrightness(0);
   M5Cardputer.Display.sleep();
@@ -3715,6 +3751,7 @@ void enterSleep() {
 
 void leaveSleep(const char *why) {
   sleeping = false;
+  alarmCheckAsking = false;  // a key or a ring ends the pre-alarm check too
   M5Cardputer.Display.wakeup();
   setIdleClock(false);  // gives the backlight back
   M5Cardputer.Speaker.begin(); applyVolumes();
@@ -3724,23 +3761,75 @@ void leaveSleep(const char *why) {
   Serial.printf("SLEEP left: %s\n", why);
 }
 
-// Milliseconds until something must wake the device: a running timer's end, a snooze's end, or the start of the
-// next alarm's minute. No radio, no internet: the chip keeps the time itself while asleep (no 32 kHz crystal on
-// the ADV, so its internal oscillator; how far that drifts over a night is measured on a device). UINT32_MAX when
-// nothing is due: only a key wakes it then.
+// The pre-alarm clock check (v0.67). Asleep, the chip keeps time on its internal oscillator (the ADV has no
+// 32 kHz crystal), and Albie's 07:00 alarm rang at 06:30 (2026-11-25; cause unproven, the sleep clock is
+// the likely one). So a sleeping device with a saved Wi-Fi wakes kAlarmCheckAheadMs before an alarm by its
+// own clock, asks the time servers, and rings by the corrected clock: woken again before the alarm if the
+// correction moved it further away, kept awake (on the main crystal) once it is near, and ringing at once if
+// the alarm's minute has already passed. No answer within kAlarmCheckWaitMs: it rings by the chip's clock,
+// as before.
+constexpr uint32_t kAlarmCheckAheadMs = 5 * 60000u;
+constexpr uint32_t kAlarmCheckWaitMs = 2 * 60000u;
+constexpr int64_t kAlarmCatchUpS = 30 * 60;   // an alarm missed by a slow clock rings late, up to this late
+uint32_t alarmCheckStartedAt = 0;
+uint32_t alarmCheckSyncCount = 0;  // clockSyncCount when the check started: a change is the answer
+int64_t alarmCheckTargetS = 0;     // the alarm's minute (UTC seconds) the check is for
+int64_t alarmAnsweredTargetS = 0;  // the last alarm a check got an answer for
+int64_t alarmFailedTargetS = 0;    // the last alarm a check got no answer for: it rings by the chip's clock
+// The nightly check (Jay, 2026-11-25): at 05:00 by the device's own clock, asleep or awake, it asks the time
+// servers once, so the morning starts from a corrected clock. A check with alarmCheckTargetS 0 is this one.
+constexpr int kNightCheckHour = 5;
+int nightCheckDoneYday = -1;       // the day (chip's clock) the nightly check last ran, answered or not
+int nightCheckYday = -1;           // the day of the one running
+bool nightAwakeAsking = false;     // awake at 05:00: the same ask through the running network task
+bool nightAwakeHadOverride = false;
+
+bool alarmCheckPossible() {
+  return !localOnlyMode && !wifiProfiles.empty() && !chargingModeActive;
+}
+
+bool nightCheckDue(int *yearDay = nullptr) {
+  struct tm wall{};
+  if (!alarmCheckPossible() || !getLocalTime(&wall, 10) || wall.tm_hour != kNightCheckHour || wall.tm_yday == nightCheckDoneYday) return false;
+  if (yearDay) *yearDay = wall.tm_yday;
+  return true;
+}
+
+// The next alarm's minute in UTC seconds by the chip's clock, or 0 if none will ring (or the clock can't ring).
+int64_t nextAlarmAtS() {
+  struct tm wall{};
+  if (!alarmClock(wall)) return 0;
+  const int32_t minutes = alarms.minutesUntil(wall.tm_wday, wall.tm_hour, wall.tm_min);
+  if (minutes <= 0) return 0;
+  return clockNowS() - wall.tm_sec + static_cast<int64_t>(minutes) * 60;
+}
+
+// Milliseconds until something must wake the device: a running timer's end, a snooze's end, the start of the
+// next alarm's minute, or the pre-alarm check before it. No radio while asleep. UINT32_MAX when nothing is
+// due: only a key wakes it then.
 uint32_t sleepWakeInMs() {
   const uint32_t now = millis();
   uint32_t wake = UINT32_MAX;
   if (timerCountdown.state == clockapps::Countdown::State::Running) wake = std::min(wake, std::max<uint32_t>(timerCountdown.leftMs(now), 1));
   if (alarms.snoozed) wake = std::min(wake, clockapps::reached(now, alarms.snoozeUntil) ? 1u : alarms.snoozeUntil - now);
+  const int64_t alarmAt = nextAlarmAtS();
+  if (alarmAt > 0) {
+    // Half a second into the alarm's minute, so the minute check sees it at once.
+    int64_t untilRing = (alarmAt - clockNowS()) * 1000 + 500;
+    // Far enough off for a check first: wake that much early (the check itself decides what's next).
+    if (alarmCheckPossible() && untilRing > static_cast<int64_t>(kAlarmCheckAheadMs) + 30000) untilRing -= kAlarmCheckAheadMs;
+    wake = std::min<uint32_t>(wake, static_cast<uint32_t>(std::max<int64_t>(1, std::min<int64_t>(untilRing, UINT32_MAX - 1))));
+  }
+  // The next 05:00 by the chip's clock, for the nightly check (today's if it hasn't run yet).
   struct tm wall{};
-  if (alarmClock(wall)) {
-    const int32_t minutes = alarms.minutesUntil(wall.tm_wday, wall.tm_hour, wall.tm_min);
-    if (minutes > 0) {
-      // Half a second into the alarm's minute, so the minute check sees it at once.
-      const int64_t untilRing = static_cast<int64_t>(minutes) * 60000 - static_cast<int64_t>(wall.tm_sec) * 1000 + 500;
-      wake = std::min<uint32_t>(wake, static_cast<uint32_t>(std::max<int64_t>(1, std::min<int64_t>(untilRing, UINT32_MAX - 1))));
-    }
+  if (alarmCheckPossible() && getLocalTime(&wall, 10)) {
+    const int32_t secondOfDay = wall.tm_hour * 3600 + wall.tm_min * 60 + wall.tm_sec;
+    const int32_t at = kNightCheckHour * 3600;
+    // Today's, unless it has run today or 05:00 has gone by; then tomorrow's.
+    const bool todayPending = wall.tm_yday != nightCheckDoneYday && wall.tm_hour <= kNightCheckHour;
+    int32_t until = at - secondOfDay;
+    if (!todayPending) until += 86400;
+    wake = std::min<uint32_t>(wake, static_cast<uint32_t>(std::max<int32_t>(until, 0)) * 1000u + 500u);
   }
   return wake;
 }
@@ -3752,13 +3841,90 @@ bool sleepOnce(uint32_t forMs) {
   gpio_wakeup_enable(kKeyboardInterruptPin, GPIO_INTR_LOW_LEVEL);
   gpio_wakeup_enable(kRearButtonPin, GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
+  const int64_t before = clockNowUs();
   esp_light_sleep_start();
+  const int64_t slept = clockNowUs() - before;
+  if (slept > 0) asleepUsSinceSync += static_cast<uint64_t>(slept);
   const bool byKey = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO;
   gpio_wakeup_disable(kKeyboardInterruptPin);
   gpio_wakeup_disable(kRearButtonPin);
   // The keyboard reader's interrupt on GPIO11 is on both edges; the wake setting replaced that with low level.
   gpio_set_intr_type(kKeyboardInterruptPin, GPIO_INTR_ANYEDGE);
   return byKey;
+}
+
+void serviceClockApps();
+void serviceClockTrust();
+void startRinging();
+
+void radioOffForSleep() {
+  sleepRadioOff = true;
+  for (const uint32_t started = millis(); !radioIsOff && millis() - started < 5000;) delay(20);
+}
+
+// Asleep, an alarm within kAlarmCheckAheadMs: start the check, or keep it going. True while the device must
+// stay awake (radio on and waiting, or near the alarm on a corrected clock).
+bool serviceAlarmCheck() {
+  const int64_t alarmAt = nextAlarmAtS();
+  const int64_t nearMs = static_cast<int64_t>(kAlarmCheckAheadMs) + 30000;
+  if (alarmCheckAsking) {
+    if (clockSyncCount != alarmCheckSyncCount && alarmCheckTargetS == 0) {
+      alarmCheckAsking = false; syncOverride = false; nightCheckDoneYday = nightCheckYday;
+      Serial.println("CLOCK nightly check answered");
+      radioOffForSleep();
+      return serviceAlarmCheck();
+    }
+    if (clockSyncCount != alarmCheckSyncCount) {
+      alarmCheckAsking = false; syncOverride = false;
+      const int64_t nowS = clockNowS();
+      alarmAnsweredTargetS = alarmCheckTargetS;
+      Serial.printf("ALARM check answered; alarm in %lld s by the corrected clock\n", static_cast<long long>(alarmCheckTargetS - nowS));
+      // A clock that ran slow: the alarm's minute already went by. Ring it now, if it isn't long past.
+      if (nowS >= alarmCheckTargetS && nowS - alarmCheckTargetS < kAlarmCatchUpS) {
+        struct tm target{}; const time_t at = static_cast<time_t>(alarmCheckTargetS);
+        localtime_r(&at, &target);
+        if (alarms.due(target.tm_wday, target.tm_yday, target.tm_hour, target.tm_min)) {
+          Serial.println("ALARM check: the corrected clock is past the alarm; ringing now");
+          alarmRinging = true; startRinging();
+        }
+      }
+      radioOffForSleep();
+      // Decided below on the corrected clock, after the radio is off: near the alarm, it stays awake.
+      return serviceAlarmCheck();
+    }
+    // No answer in time, or the chip's clock reached the alarm first: ring by the chip's clock, as before.
+    if (millis() - alarmCheckStartedAt >= kAlarmCheckWaitMs || (alarmCheckTargetS && alarmAt != alarmCheckTargetS)) {
+      alarmCheckAsking = false; syncOverride = false; clockCheckWhy = "sync";
+      if (alarmCheckTargetS) { alarmFailedTargetS = alarmCheckTargetS; Serial.println("ALARM check: no time server answered; ringing by the chip's clock"); }
+      else { nightCheckDoneYday = nightCheckYday; Serial.println("CLOCK nightly check: no time server answered"); }
+      radioOffForSleep();
+      return false;
+    }
+    return true;
+  }
+  // Answered on this approach with no light sleep since: awake on the main crystal for the last few minutes,
+  // through the alarm's whole minute (the minute check runs once a second). A sleep since the answer drifted
+  // again, so that asks again.
+  const int64_t nowS = clockNowS();
+  if (alarmAnsweredTargetS && asleepUsSinceSync == 0 && nowS < alarmAnsweredTargetS + 60 &&
+      (alarmAnsweredTargetS - nowS) * 1000 <= nearMs) return true;
+  int yearDay = -1;
+  if (nightCheckDue(&yearDay)) {
+    alarmCheckTargetS = 0; nightCheckYday = yearDay; alarmCheckStartedAt = millis(); alarmCheckSyncCount = clockSyncCount;
+    alarmCheckAsking = true;
+    syncOverride = true; clockAskWanted = true; sleepRadioOff = false;
+    clockCheckWhy = "night-check";
+    Serial.println("CLOCK nightly check: asking the time servers");
+    return true;
+  }
+  if (alarmAt == 0 || (alarmAt - nowS) * 1000 > nearMs) return false;
+  if (alarmFailedTargetS == alarmAt || !alarmCheckPossible()) return false;
+  // A check for this approach: the first, or another after one that moved the alarm further away.
+  alarmCheckTargetS = alarmAt; alarmCheckStartedAt = millis(); alarmCheckSyncCount = clockSyncCount;
+  alarmCheckAsking = true; clockCheckWhy = "alarm-check";
+  syncOverride = true; clockAskWanted = true; sleepRadioOff = false;  // past the night-time Wi-Fi rule too
+  Serial.printf("ALARM check: alarm in %lld s by the chip's clock; asking the time servers\n", static_cast<long long>(alarmAt - clockNowS()));
+  return true;
 }
 
 void serviceClockApps();
@@ -3769,12 +3935,38 @@ bool serviceSleep() {
     if (sleepAllowed() && millis() - lastUserInputAt >= kSleepAfterMs) enterSleep();
     return sleeping;
   }
-  const bool byKey = sleepOnce(sleepWakeInMs());
+  // The alarm's minute first: past it, the next alarm is tomorrow's and the check below would sleep through it.
+  serviceClockApps();
+  // The pre-alarm check keeps the chip awake (radio on, or on the main crystal near the alarm), screen off.
+  const bool awake = ringingNow() == Ringing::None && serviceAlarmCheck();
+  bool byKey = false;
+  if (ringingNow() != Ringing::None) {}
+  else if (awake) { serviceClockTrust(); delay(50); }
+  else byKey = sleepOnce(sleepWakeInMs());
   M5Cardputer.update();
   if (byKey || M5Cardputer.Keyboard.isPressed() || M5Cardputer.BtnA.isPressed()) { leaveSleep("key"); return false; }
   serviceClockApps();
   if (ringingNow() != Ringing::None) { leaveSleep("ringing"); return false; }
   return true;
+}
+
+// Awake at 05:00 (not asleep, not charging): the nightly check through the running network task, past the
+// night-time Wi-Fi rule for at most kAlarmCheckWaitMs.
+void serviceNightCheckAwake() {
+  if (sleeping) return;
+  if (nightAwakeAsking) {
+    if (clockSyncCount != alarmCheckSyncCount || millis() - alarmCheckStartedAt >= kAlarmCheckWaitMs) {
+      Serial.println(clockSyncCount != alarmCheckSyncCount ? "CLOCK nightly check answered" : "CLOCK nightly check: no time server answered");
+      nightAwakeAsking = false; nightCheckDoneYday = nightCheckYday; syncOverride = nightAwakeHadOverride; clockCheckWhy = "sync";
+    }
+    return;
+  }
+  int yearDay = -1;
+  if (alarmCheckAsking || !nightCheckDue(&yearDay)) return;
+  nightCheckYday = yearDay; alarmCheckStartedAt = millis(); alarmCheckSyncCount = clockSyncCount;
+  nightAwakeAsking = true; nightAwakeHadOverride = syncOverride;
+  syncOverride = true; clockAskWanted = true; clockCheckWhy = "night-check";
+  Serial.println("CLOCK nightly check: asking the time servers");
 }
 
 void serviceIdleClock() {
@@ -5894,7 +6086,7 @@ static void loopBody() {
   M5Cardputer.update();
   if (M5Cardputer.BtnA.isPressed()) lastUserInputAt = millis();
   if (morningReload) { morningReload = false; loadMorningBrief(); renderDirty = true; }
-  serviceClockTrust(); sampleBattery(); handleKeyboard(); serviceFoxFinding(); serviceClockApps();
+  serviceClockTrust(); serviceNightCheckAwake(); sampleBattery(); handleKeyboard(); serviceFoxFinding(); serviceClockApps();
   if (ringingNow() != Ringing::None && M5Cardputer.BtnA.wasClicked()) {
     if (clockapps::reached(millis(), ringKeysFrom)) dismissRinging(true);
     delay(2); return;

@@ -3,7 +3,7 @@ export const homeApps = ['SUPACHAT','MUSIC','BOOKS','R/C','TIMER','ALARM','CLOCK
 const clockScreens = ['timer','alarm','clock','screen-time','stopwatch'];
 const settingsScreens = ['networks','password','volume','status','language','charging-confirm','changelog'];
 export const changelog = [
-  {version:'v0.67',lines:['Three volumes: ALARM, SYSTEM, MEDIA','MEDIA in 20 steps','Up/Down in players: MEDIA','Alarm checks the time first']},
+  {version:'v0.67',lines:['Three volumes: ALARM, SYSTEM, MEDIA','MEDIA in 20 steps','Up/Down in players: MEDIA','Alarm checks the time first','Clock checked at 05:00']},
   {version:'v0.66',lines:['Clock always shows a time','ESTIMATED when off Wi-Fi','Morning report after alarm','AGENDA on the last page']},
   {version:'v0.65',lines:['CLOCK on Home, by TIMER','SCREEN moved to the last page','Messages arrive during sync']},
   {version:'v0.64',lines:['Songs with lyrics in blue','Check: on your play list','RIGHT adds, LEFT removes','G0 goes back','Long names scroll','Start: READY, then a key','Fn+J: large type for Papa']},

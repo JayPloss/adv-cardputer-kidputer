@@ -21,16 +21,10 @@ typedef enum {
 inline esp_reset_reason_t esp_reset_reason() { return ESP_RST_SW; }
 #endif
 
-// 2. sntp_restart(): asks lwIP's SNTP client to query the time servers again. The emulator has no SNTP
-//    client: its configTzTime answers at once whenever its network is up. The stand-in does nothing.
-//    Not covered: the re-ask on a Wi-Fi rejoin, and the drift a real answer corrects (/supachat-clock.csv).
-inline bool sntp_restart() { return true; }
-
-// 3. gettimeofday() / settimeofday(): the chip's own clock. In the emulator settimeofday does nothing and the
-//    device's time is the scenario's virtual wall clock, which only getLocalTime reads (libc's gettimeofday
-//    there is the PC's clock). The stand-in reads the virtual clock, to the second, so the clock-trust code
-//    sees the same time the screens show. Not covered: sub-second readings, so the drift logged on a sync
-//    is whole seconds here.
+// 2. gettimeofday(): the chip's clock. The emulator keeps one (the world's time plus an offset that settimeofday
+//    sets and light sleep's drift adds to, `clock-drift`), but only getLocalTime reads it there (libc's
+//    gettimeofday is the PC's clock). The stand-in reads it through getLocalTime, to the second.
+//    Not covered: sub-second readings, so the drift logged on a sync is whole seconds here.
 #include <sys/time.h>
 #include <time.h>
 inline int emuChipClock(struct timeval *value) {

@@ -41,16 +41,15 @@ def gate_key(repo, runtime):
 NOT_EMULATED = {
     "esp_reset_reason": "reset cause from the chip's RTC domain; the emulator's clock always equals world time, "
                         "so a clock lost with the power (unknown tier, high-water mark) can't be shown",
-    "sntp_restart": "lwIP's SNTP client; the emulator answers the time at once, so the re-ask on a Wi-Fi rejoin "
-                    "and the drift it corrects aren't exercised",
-    "gettimeofday": "the chip's clock; the emulator's time is its virtual wall clock, read to the second, so "
-                    "sub-second drift isn't seen",
+    "gettimeofday": "the chip's clock, read through getLocalTime to the second, so the drift a sync logs is "
+                    "whole seconds",
 }
 # Scenarios skipped because what they check depends on a function above, and why.
 NOT_EMULATED_SCENARIOS = {
-    "book-sleep": "sntp_restart: its `clock` line moves the time with no time-server answer behind it; v0.66 trusts "
-                  "a clock for quiet-time rules only from an answer, so the bedtime timer is off there",
-    "school-night": "sntp_restart: same as book-sleep, for the 21:30 school-night stop",
+    "book-sleep": "its `clock` line moves the time with no time-server answer behind it (the SNTP stand-in asks only "
+                  "when a device would); v0.66 trusts a clock for quiet-time rules only from an answer, so the bedtime "
+                  "timer is off there",
+    "school-night": "same as book-sleep, for the 21:30 school-night stop",
 }
 
 

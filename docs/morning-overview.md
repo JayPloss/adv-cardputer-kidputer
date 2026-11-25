@@ -39,9 +39,30 @@ moved forward to it (no rollback can reopen a closed window).
 
 ### Sync
 
-SNTP as before. When Wi-Fi joins and the tier is not synced, SNTP is restarted so the answer comes at once. Every
-answer logs the drift (`CLOCK sync drift +12.4 s after 7.2 h, was estimated`) to the serial log and to
-`/supachat-clock.csv` on the card, to measure the chip's drift in light sleep (PARENT-CONTROLS.md, next step 3).
+SNTP as before. When Wi-Fi joins and the tier is not synced, SNTP is restarted so the answer comes at once.
+
+Every answer measures the drift exactly (v0.67): the firmware replaces ESP-IDF's weak `sntp_sync_time`, reads the
+chip's clock just before setting it, and logs the server's time minus the chip's (negative: the chip ran fast),
+the hours since the sync before, and how many of them were in light sleep, which runs on the chip's internal
+oscillator. It goes to the serial log (`CLOCK sync drift -1803.0 s after 9.8 h (8.1 h asleep), was estimated,
+alarm-check`), to `/supachat-clock.csv` on the card (`utc_s,firmware,tier_before,hours_since_sync,drift_s,
+hours_asleep,why`; rows before v0.67 have the first five), and to STATUS page 2 as `DRIFT`.
+
+### Checks before mornings (v0.67)
+
+Albie's 07:00 alarm rang at 06:30 on 2026-11-25; the cause is unproven, and the sleep clock is the likely one.
+
+- **Nightly, 05:00** by the device's own clock (Jay): asleep or awake, a device with a saved network asks the time
+  servers once, past the night-time Wi-Fi rule, for at most 2 minutes.
+- **Before each alarm:** a sleeping device with a saved network wakes 5 minutes before the alarm by its own
+  clock, asks, and rings by the corrected clock. If the correction moved the alarm further away it sleeps and
+  checks again; once near with no sleep since the answer, it stays awake (main crystal) through the alarm's
+  minute. A corrected clock already past the alarm rings it at once, up to 30 minutes late. No answer in 2
+  minutes: it rings by the chip's clock, as before.
+- Not in charging mode, local mode or with no saved network. Charging mode keeps the chip awake on its main
+  crystal, so its clock doesn't take the sleep drift.
+- Runtime emulator: `alarm-drift` and `night-check`, with the chip's clock 50 % fast in light sleep
+  (`clock-drift`).
 
 ## B. Morning Overview v2
 
