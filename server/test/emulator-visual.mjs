@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { changelog } from '../../emulator/state.mjs';
 
 const base = process.env.SUPACHAT_EMULATOR_URL || 'http://127.0.0.1:8877/emulator/';
 const output = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../emulator/screens');
@@ -35,7 +36,8 @@ await bootShot('/firmware/assets/boot/supachat-splash-albie-240x135.png', 'boot-
 await bootShot('/firmware/assets/boot/supachat-splash-juju-240x135.png', 'boot-juju');
 await bootShot('/firmware/assets/boot/supachat-splash-papa-240x135.png', 'boot-papa');
 await bootShot('/firmware/assets/boot/supachat-splash-mama-240x135.png', 'boot-mama');
-await page.reload();
+// HOME is the first screen since v0.55; the chat checks open chat directly.
+await page.goto(`${base}?screen=chat`);
 
 await shot('chat');
 await page.getByRole('button', { name: 'SHIFT + / = ?' }).click();
@@ -80,14 +82,19 @@ await openHome(13); assert.equal((await state()).localOnly,true); assert.equal((
 await openHome(12); await shot('charging-confirm'); await page.getByRole('button', { name: 'ENTER' }).click(); assert.equal((await state()).charging,true); await shot('charging-active');
 await openHome(10); await shot('status-link'); await page.locator('[data-key="RIGHT"]').click(); assert.equal((await state()).statusPage,1); await shot('status'); await page.locator('[data-key="RIGHT"]').click(); assert.equal((await state()).statusPage,2); await shot('status-diagnostics-empty');
 await page.reload(); await page.getByLabel('Sync fault injection').selectOption('bad-data'); await page.getByRole('button', { name: 'REAR · MENU' }).click(); await page.locator('[data-key="RIGHT"]').click(); for(let i=0;i<4;i++)await page.getByRole('button', { name: '↓ .' }).click(); await page.getByRole('button', { name: 'ENTER' }).click(); await page.locator('[data-key="RIGHT"]').click(); assert.equal((await state()).lastSyncError,'BAD JSON'); await shot('status-diagnostics-bad-json');
-await openHome(14); await shot('changelog-current'); await page.locator('[data-key="RIGHT"]').click(); assert.equal((await state()).changelogSelection,1); await shot('changelog-previous'); await page.getByRole('button', { name: '↓ .' }).click(); assert.equal((await state()).changelogLineOffset,1); await shot('changelog-scrolled');
+await openHome(14); await shot('changelog-current'); await page.locator('[data-key="RIGHT"]').click(); assert.equal((await state()).changelogSelection,1); await shot('changelog-previous');
+// Down scrolls an entry longer than the four lines shown: the first such entry, whichever release that is.
+const longEntry = changelog.findIndex((entry) => entry.lines.length > 4);
+for (let i = 1; i < longEntry; i++) await page.locator('[data-key="RIGHT"]').click();
+if (longEntry === 0) await page.locator('[data-key="LEFT"]').click();
+await page.getByRole('button', { name: '↓ .' }).click(); assert.equal((await state()).changelogLineOffset,1); await shot('changelog-scrolled');
 await openMenu(6); await shot('fox-finding-select'); await page.getByRole('button', { name: 'ENTER' }).click(); assert.equal((await state()).foxState,'requesting'); await shot('fox-finding-requesting');
 await page.evaluate(()=>{window.__supachatState.foxAck();window.__supachatState.foxPlaceResult();window.__supachatDraw()}); assert.equal((await state()).foxState,'guiding'); await shot('fox-finding-guiding');
 await page.evaluate(()=>{window.__supachatState.foxLoseSignal();window.__supachatDraw()}); await shot('fox-finding-signal-lost');
 await openMenu(6); await page.evaluate(()=>{window.__supachatState.offerPack('Papa','Juju',77);window.__supachatDraw()}); await shot('fox-finding-pack-invite'); await page.getByRole('button', { name: 'ENTER' }).click(); await page.evaluate(()=>{window.__supachatState.foxPlaceResult();window.__supachatState.packObservation('Albie',{rssi:-67,similarity:72,confidence:2});window.__supachatState.packObservation('Papa',{rssi:-52,similarity:80,confidence:3});window.__supachatState.packObservation('Naomie',{rssi:-60,similarity:91,confidence:2});window.__supachatDraw()}); assert.equal((await state()).foxJoinedPack,true); await shot('fox-finding-pack-guiding');
 await page.reload(); await page.getByLabel('Sync fault injection').selectOption('io');
 assert.equal((await state()).network, 'SYNC IO -1'); await shot('chat-sync-io');
-await page.goto(`${base}?language=fr`);
+await page.goto(`${base}?language=fr&screen=chat`);
 // The French layout (CSA): / is é, [ then e is ê, ' is è, \ is à, Shift+6 is ?.
 const entry = page.getByLabel('Printable text');
 await entry.fill("/[e'\\^"); await entry.dispatchEvent('input');
