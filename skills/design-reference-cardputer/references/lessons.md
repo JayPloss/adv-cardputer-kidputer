@@ -14,6 +14,8 @@ Each item says where it came from. Add to this list; don't delete from it unless
 
 - **Feedback tones follow the volume setting, and were painfully loud against speech.** Jay, 2026-11-01: "LOUD bloops and quiet talking are bad for ears." In the listening apps tones now sit at `kListeningToneVolume`. Any new sound goes through the same volume path as `playNextTone()`, and stays silent during recording, playback and charging mode, as that does.
 
+- **Three volumes since v0.67, on speaker channels, not the master.** ALARM, SYSTEM and MEDIA each set their own channel's volume with the master at full (M5Unified squares both and multiplies them). Media plays on channel 1, tones and voice messages on 0. A sound with no channel named takes any free channel at its full 255, so every new `tone()` or `playRaw()` names its channel and sets that channel's volume first: the message notification had none, and would have played at full volume (found writing v0.67; the runtime emulator's `expect-volume` checks it now).
+
 ## Text
 
 - **`Font2` has no accents.** French came out wrong until chat moved to `Font0` (commit "Fix contextual arrows and French glyph rendering"). Check any new font with the specimen: an ASCII font can report that it has a letter and still draw the wrong one.

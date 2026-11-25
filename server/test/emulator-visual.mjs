@@ -67,7 +67,12 @@ await page.waitForTimeout(250); await shot('voice-message-recording'); await pag
 assert.equal((await state()).clipReady, true); await page.getByRole('button', { name: 'ENTER' }).click();
 assert.equal((await state()).replayAudible, true); await shot('voice-message-replay');
 await openMenu(4); await shot('walkie-ready'); await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2); await page.mouse.down(); await page.waitForTimeout(250); await shot('walkie-transmitting'); await page.mouse.up(); assert.equal((await state()).clipPending,false);
-await openHome(9); await shot('volume');
+await openHome(9); await shot('volume'); assert.equal((await state()).volumeRow, 2);
+// MEDIA has 20 steps: Right from 15 reaches 16; Up to SYSTEM, Left lowers it; ALARM stops at LOW.
+await page.locator('[data-key="RIGHT"]').click(); assert.equal((await state()).volumes.media, 16);
+await page.getByRole('button', { name: '↑ ;' }).click(); await page.locator('[data-key="LEFT"]').click(); assert.equal((await state()).volumes.system, 2);
+await page.getByRole('button', { name: '↑ ;' }).click(); for (let i = 0; i < 3; i++) await page.locator('[data-key="LEFT"]').click(); assert.equal((await state()).volumes.alarm, 1);
+await shot('volume-alarm-low');
 await openHome(11); await shot('language'); await page.locator('[data-key="RIGHT"]').click(); assert.equal((await state()).languageOverride, 'en'); assert.equal((await state()).screen,'language');
 await openHome(8); await shot('networks'); await page.getByRole('button', { name: 'ENTER' }).click(); await shot('network-password');
 await page.reload(); await page.getByRole('button', { name: 'REAR · MENU' }).click(); await page.locator('[data-key="RIGHT"]').click(); await shot('menu-page-2');

@@ -87,7 +87,7 @@ const char *failureText(const char *english) {
   if (frenchUi) for (const auto &pair : kFrench) if (!strcmp(english, pair[0])) return pair[1];
   return english;
 }
-constexpr char kFirmwareVersion[] = "v0.66";
+constexpr char kFirmwareVersion[] = "v0.67";
 // The author of the device's own notes to its owner: no account has this id.
 constexpr char kNoticeAuthor[] = "kidputer";
 // Lyrics show only when asked for: L (lyrics) in English, P (paroles) in French, turns them on and off; remembered.
@@ -106,9 +106,19 @@ constexpr size_t kRamMessageLimit = 40;
 constexpr size_t kShrunkMessages = 5;
 constexpr uint32_t kToneIntervalMs = 40;
 constexpr uint32_t kToneDurationMs = 180;
-constexpr uint8_t kDefaultVolumeLevel = 3;
+// Three volumes, each its own NVS key (v0.67). The speaker's master stays at full; each sound sets
+// its own channel's volume, since M5Unified squares both and multiplies them.
+//   MEDIA:  music, books, the morning brief, voice messages. 0 is mute, then 20 steps.
+//   SYSTEM: key tones, notifications, warning beeps. MUTE LOW MEDIUM HIGH MAX, as the old setting was.
+//   ALARM:  the alarm, timer and screen-time rings. LOW to MAX, no mute; every ring climbs to MAX in 30 s.
+constexpr uint8_t kMediaSteps = 20;
+constexpr uint8_t kDefaultMediaLevel = 15;   // the old HIGH
+constexpr uint8_t kDefaultSystemLevel = 3;   // HIGH
+constexpr uint8_t kDefaultAlarmLevel = 2;    // MEDIUM: the floor the alarm had before
+constexpr uint8_t kAlarmFloorLevel = 1;      // LOW: a ring is never silent
 constexpr uint8_t kVolumeValues[] = {0, 64, 128, 192, 255};
 constexpr char const *kVolumeNames[] = {"MUTE", "LOW", "MEDIUM", "HIGH", "MAX"};
+constexpr char const *kVolumeNamesFr[] = {"MUET", "BAS", "MOYEN", "FORT", "MAX"};
 constexpr uint32_t kRenderIntervalMs = 50;
 constexpr uint32_t kWifiRetryMs = 30000;
 constexpr uint32_t kSyncPollMs = 3000;
@@ -397,7 +407,22 @@ volatile bool localOnlyMode = false;
 volatile bool wifiResumeRequested = false;
 int roomSelection = 0;
 int networkSelection = 0;
-uint8_t volumeLevel = kDefaultVolumeLevel;
+uint8_t mediaLevel = kDefaultMediaLevel;    // 0..kMediaSteps
+uint8_t systemLevel = kDefaultSystemLevel;  // 0..4
+uint8_t alarmLevel = kDefaultAlarmLevel;    // kAlarmFloorLevel..4
+int volumeRow = 2;                          // the VOLUME screen's row: 0 ALARM, 1 SYSTEM, 2 MEDIA
+uint8_t mediaChannelValue(uint8_t level) { return static_cast<uint8_t>((static_cast<uint16_t>(level) * 255 + kMediaSteps / 2) / kMediaSteps); }
+uint8_t mediaValue() { return mediaChannelValue(mediaLevel); }
+uint8_t systemValue() { return kVolumeValues[systemLevel]; }
+// Media and voice messages: master at full, media's channel (1, the player's) at its level.
+void applyMediaVolume(uint8_t value) {
+  M5Cardputer.Speaker.setVolume(255); M5Cardputer.Speaker.setChannelVolume(1, value);
+}
+void applyVolumes() { applyMediaVolume(mediaValue()); }
+// Tones on channel 0 at a given value, master at full.
+void applyToneVolume(uint8_t value) {
+  M5Cardputer.Speaker.setVolume(255); M5Cardputer.Speaker.setChannelVolume(0, value);
+}
 int64_t lastServerId = 0;
 int64_t lastReceiptAt = 0;
 int lastHttpStatus = 0;
@@ -800,7 +825,7 @@ void awaitBootKey() {
 }
 
 void showBootSplash() {
-  M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  applyVolumes();
   size_t step = 0;
   const uint32_t bootStarted = millis();
   os::Boot shownPhase = os::Boot::Joining;
@@ -819,6 +844,7 @@ void showBootSplash() {
     }
     const size_t noteIndex = step % kBootTuneLength;
     if (kBootTuneFrequencies[noteIndex] > 0) {
+      applyToneVolume(systemValue());
       M5Cardputer.Speaker.tone(kBootTuneFrequencies[noteIndex], kBootTuneNoteMs, 0, true);
     }
     // Schedule from the time this note was actually submitted. A cumulative
@@ -990,16 +1016,28 @@ void loadConfiguration() {
   if (languageOverride != "auto" && languageOverride != "en" && languageOverride != "fr") languageOverride = "auto";
   frenchUi = languageOverride == "fr" || (languageOverride == "auto" && kBuildFrenchDefault);
   meshReady = decodeHexKey(preferences.getString("mesh_key", ""), meshKey, sizeof(meshKey));
-  volumeLevel = std::min<uint8_t>(preferences.getUChar("volume", kDefaultVolumeLevel), 4);
+  // "volume" is the single 5-step setting before v0.67; it is read once, to start the three volumes.
+  uint8_t oldVolume = std::min<uint8_t>(preferences.getUChar("volume", kDefaultSystemLevel), 4);
   // Older installs commonly persisted MAX as their effective default. Migrate
   // that once so updated devices start at HIGH without overriding later choices.
   if (!preferences.getBool("high_default", false)) {
-    if (volumeLevel == 4) {
-      volumeLevel = kDefaultVolumeLevel;
-      preferences.putUChar("volume", volumeLevel);
+    if (oldVolume == 4) {
+      oldVolume = kDefaultSystemLevel;
+      preferences.putUChar("volume", oldVolume);
     }
     preferences.putBool("high_default", true);
   }
+  if (!preferences.isKey("vol_media")) {
+    // The old steps were 0, 64, 128, 192, 255: five media steps each, so LOW is 5/20 and HIGH 15/20.
+    preferences.putUChar("vol_media", oldVolume * (kMediaSteps / 4));
+    preferences.putUChar("vol_system", oldVolume);
+    // The alarm already started at MEDIUM at least.
+    preferences.putUChar("vol_alarm", std::max<uint8_t>(oldVolume, kDefaultAlarmLevel));
+    Serial.printf("VOLUME from the old setting %u\n", oldVolume);
+  }
+  mediaLevel = std::min<uint8_t>(preferences.getUChar("vol_media", kDefaultMediaLevel), kMediaSteps);
+  systemLevel = std::min<uint8_t>(preferences.getUChar("vol_system", kDefaultSystemLevel), 4);
+  alarmLevel = std::max<uint8_t>(kAlarmFloorLevel, std::min<uint8_t>(preferences.getUChar("vol_alarm", kDefaultAlarmLevel), 4));
   persistedBatteryLevel = preferences.getInt("battery_soc", -1);
   lyricsWanted = preferences.getBool("lyrics", false);
   shuffleOn = preferences.getBool("play_mix", false);
@@ -1046,9 +1084,11 @@ void saveClockSettings() {
 
 void saveVolume() {
   preferences.begin("supachat", false);
-  preferences.putUChar("volume", volumeLevel);
+  preferences.putUChar("vol_media", mediaLevel);
+  preferences.putUChar("vol_system", systemLevel);
+  preferences.putUChar("vol_alarm", alarmLevel);
   preferences.end();
-  M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  applyVolumes();
 }
 
 void saveWifiProfiles() {
@@ -1081,10 +1121,11 @@ bool localBlackout() {
   return value.tm_hour >= 22 || value.tm_hour < 6;
 }
 
-// Tones are full-scale and speech isn't, so beside a book or song they sit well below it.
+// Tones are full-scale and speech isn't, so beside a book or song they sit well below it:
+// the system volume, scaled as the master and channel were multiplied before v0.67.
 uint8_t toneChannelVolume() {
   const bool listening = media::active() || screenMode == ScreenMode::Library || screenMode == ScreenMode::LibrarySearch || screenMode == ScreenMode::NowPlaying;
-  return listening ? kListeningToneVolume : 255;
+  return listening ? static_cast<uint8_t>(systemValue() * kListeningToneVolume / 255) : systemValue();
 }
 
 void playNextTone() {
@@ -1092,8 +1133,7 @@ void playNextTone() {
   const uint32_t now = millis();
   if (now - lastToneAt < kToneIntervalMs || kKeypressSongLength == 0) return;
   lastToneAt = now;
-  M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
-  M5Cardputer.Speaker.setChannelVolume(0, toneChannelVolume());
+  applyToneVolume(toneChannelVolume());
   M5Cardputer.Speaker.tone(kKeypressSongFrequencies[songPosition], kToneDurationMs, 0, true);
   songPosition = (songPosition + 1) % kKeypressSongLength;
 }
@@ -1102,15 +1142,23 @@ void playNextTone() {
 void playDeniedTone() {
   if (chargingModeActive || voiceRecording || audioPlaying || messageNotificationActive) return;
   lastToneAt = millis();
-  M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
-  M5Cardputer.Speaker.setChannelVolume(0, toneChannelVolume());
+  applyToneVolume(toneChannelVolume());
   M5Cardputer.Speaker.tone(294, 70, 0, true);
   M5Cardputer.Speaker.tone(196, 120, 0, false);
 }
 
+// What a changed volume sounds like: one key-song note at the alarm's or media's volume, or a plain key tone.
+void playVolumeSample(int row) {
+  if (row == 1) { playNextTone(); return; }
+  if (chargingModeActive || voiceRecording || audioPlaying || messageNotificationActive) return;
+  lastToneAt = millis();
+  applyToneVolume(row == 0 ? kVolumeValues[alarmLevel] : mediaValue());
+  M5Cardputer.Speaker.tone(880, 120, 0, true);
+}
+
 void serviceMessageNotification() {
   if (chargingModeActive) { messageNotificationPending = false; messageNotificationActive = false; return; }
-  if (volumeLevel == 0) { messageNotificationPending = false; messageNotificationActive = false; return; }
+  if (systemLevel == 0) { messageNotificationPending = false; messageNotificationActive = false; return; }
   if (voiceRecording || audioPlaying) return;
   const uint32_t now = millis();
   if (!messageNotificationActive) {
@@ -1122,9 +1170,10 @@ void serviceMessageNotification() {
   if (messageNotificationPosition >= kMessageNotificationLength) {
     messageNotificationActive = false; return;
   }
-  M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  // Channel 0, named: an unnamed channel is any free one, at its own full volume.
+  applyToneVolume(systemValue());
   M5Cardputer.Speaker.tone(kMessageNotificationFrequencies[messageNotificationPosition],
-                           kMessageNotificationDurations[messageNotificationPosition]);
+                           kMessageNotificationDurations[messageNotificationPosition], 0, true);
   nextMessageNotificationAt = now + kMessageNotificationDurations[messageNotificationPosition] + kMessageNotificationGapMs;
   messageNotificationPosition++;
 }
@@ -1182,7 +1231,7 @@ void startVoiceRecording() {
   M5Cardputer.Mic.config(micConfig);
   if (!M5Cardputer.Mic.begin()) {
     if (voiceCaptureFile) voiceCaptureFile.close();
-    M5Cardputer.Speaker.begin(); M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+    M5Cardputer.Speaker.begin(); applyVolumes();
     walkieStatus = "MIC START FAILED"; retainCurrentVoice = false; renderDirty = true; return;
   }
   voiceRecording = true; voiceStartedAt = millis(); walkieStatus = "RECORDING"; renderDirty = true;
@@ -1203,7 +1252,7 @@ void stopVoiceRecording() {
   if (voiceCaptureFile) {
     xSemaphoreTake(stateMutex, portMAX_DELAY); voiceCaptureFile.flush(); voiceCaptureFile.close(); xSemaphoreGive(stateMutex);
   }
-  M5Cardputer.Mic.end(); M5Cardputer.Speaker.begin(); M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  M5Cardputer.Mic.end(); M5Cardputer.Speaker.begin(); applyVolumes();
   if (voiceLiveMode && kEspNowEnabled && !walkieConnected) flushNearbyFrame(true);
   voiceRecording = false;
   if (retainCurrentVoice) {
@@ -1267,8 +1316,9 @@ void captureVoice() {
 }
 
 bool queuePlaybackSamples(std::vector<int16_t> samples) {
-  if (chargingModeActive || samples.empty() || voiceRecording || volumeLevel == 0 || M5Cardputer.Speaker.isPlaying(0) >= 2) return false;
-  M5Cardputer.Mic.end(); M5Cardputer.Speaker.begin(); M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  if (chargingModeActive || samples.empty() || voiceRecording || mediaLevel == 0 || M5Cardputer.Speaker.isPlaying(0) >= 2) return false;
+  // A voice message is media, played on channel 0 between tones.
+  M5Cardputer.Mic.end(); M5Cardputer.Speaker.begin(); applyToneVolume(mediaValue());
   auto &buffer = playbackBuffers[playbackBufferIndex]; buffer = std::move(samples);
   const bool queued = M5Cardputer.Speaker.playRaw(buffer.data(), buffer.size(), kVoiceSampleRate, false, 1, 0, false);
   if (queued) playbackBufferIndex = (playbackBufferIndex + 1) % playbackBuffers.size();
@@ -1927,7 +1977,7 @@ void exitChargingMode() {
   inputQuarantined = true;
   setCpuFrequencyMhz(240);
   M5Cardputer.Display.setBrightness(255);
-  M5Cardputer.Speaker.begin(); M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  M5Cardputer.Speaker.begin(); applyVolumes();
   WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(false); WiFi.persistent(false); WiFi.disconnect(false, false);
   if (kEspNowEnabled) initializeEspNow();
   wifiResumeRequested = true; syncOverride = true; networkStatus = "RESUMING";
@@ -2784,16 +2834,33 @@ void drawWalkie() {
   }
 }
 
+String volumeValueText(int row) {
+  if (row == 2) return mediaLevel == 0 ? String(uiText("MUTE", "MUET")) : String(mediaLevel) + "/" + String(kMediaSteps);
+  const uint8_t level = row == 0 ? alarmLevel : systemLevel;
+  return frenchUi ? kVolumeNamesFr[level] : kVolumeNames[level];
+}
+
+// Three rows, ALARM / SYSTEM / MEDIA: Up and Down choose one, Left and Right change it.
 void drawVolume() {
   auto &display = uiCanvas; display.fillScreen(TFT_BLACK); drawHeader("VOLUME");
-  display.setTextSize(2); display.setTextColor(TFT_YELLOW, TFT_BLACK);
-  display.setCursor(72, 39); display.print(kVolumeNames[volumeLevel]);
-  for (int index = 0; index < 5; index++) {
-    const int x = 20 + index * 42;
-    display.fillRoundRect(x, 72, 30, 20, 4, index <= volumeLevel && volumeLevel > 0 ? TFT_GREEN : TFT_DARKGREY);
+  const char *labels[] = {uiText("ALARM", "ALARME"), uiText("SYSTEM", "SYSTEME"), uiText("MEDIA", "MEDIAS")};
+  for (int row = 0; row < 3; row++) {
+    const int y = 25 + row * 28;
+    const bool chosen = row == volumeRow;
+    if (chosen) display.drawRoundRect(4, y - 3, 232, 26, 4, TFT_YELLOW);
+    display.setTextSize(2); display.setTextColor(chosen ? TFT_YELLOW : TFT_WHITE, TFT_BLACK);
+    display.setCursor(10, y); display.print(labels[row]);
+    const String value = volumeValueText(row);
+    display.setCursor(230 - static_cast<int>(value.length()) * 12, y); display.print(value);
+    const int segments = row == 2 ? kMediaSteps : 4;
+    const int level = row == 0 ? alarmLevel : row == 1 ? systemLevel : mediaLevel;
+    const int slot = 220 / segments;
+    for (int index = 0; index < segments; index++)
+      display.fillRect(10 + index * slot, y + 16, slot - 2, 4, index < level ? (chosen ? TFT_GREEN : TFT_DARKGREEN) : TFT_DARKGREY);
   }
   display.setTextSize(1); display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  display.setCursor(6, 116); display.print(uiText("LEFT/RIGHT CHANGE   OK BACK", "GAUCHE/DROITE CHANGER OK RETOUR"));
+  display.setCursor(6, 111); display.print(uiText("UP/DOWN CHOOSE  LEFT/RIGHT CHANGE", "HAUT/BAS CHOISIR GAUCHE/DROITE REGLER"));
+  display.setCursor(6, 123); display.print(uiText("OK BACK", "OK RETOUR"));
 }
 
 String utf8Head(const String &text, size_t maximumCharacters);
@@ -3232,7 +3299,7 @@ void drawNowPlaying() {
     display.setCursor(lyricsShown ? 102 : 72, infoY); display.setTextColor(TFT_CYAN, TFT_BLACK);
     display.print(uiText("SLEEP ", "DODO ")); display.print(clockText(sleepTimer.leftSeconds(millis())));
   }
-  display.setCursor(lyricsShown ? 190 : 178, infoY); display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.print(kVolumeNames[volumeLevel]);
+  display.setCursor(lyricsShown ? 190 : 178, infoY); display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.printf("VOL %u", mediaLevel);
   if (item->liked) { display.setCursor(lyricsShown ? 178 : 160, infoY); display.setTextColor(TFT_YELLOW, TFT_BLACK); display.print("*"); }
   display.setTextColor(TFT_DARKGREY, TFT_BLACK);
   display.setCursor(6, 110);
@@ -3650,7 +3717,7 @@ void leaveSleep(const char *why) {
   sleeping = false;
   M5Cardputer.Display.wakeup();
   setIdleClock(false);  // gives the backlight back
-  M5Cardputer.Speaker.begin(); M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  M5Cardputer.Speaker.begin(); applyVolumes();
   sleepRadioOff = false; syncOverride = true;
   lastUserInputAt = millis(); inputQuarantined = true;  // the waking key does nothing else
   renderDirty = true;
@@ -3781,14 +3848,14 @@ void dismissRinging(bool stop) {
   renderDirty = true;
 }
 
-// Louder over time: from the volume setting (at least the middle step) up to full in 30 seconds.
+// Louder over time: from the alarm volume (LOW at least) up a step every 10 s, to full in 30 seconds.
 void serviceRingTone(uint32_t now) {
   const Ringing what = ringingNow();
   if (what == Ringing::None || !clockapps::reached(now, nextRingToneAt)) return;
-  const uint8_t ramp = std::min<uint8_t>(4, std::max<uint8_t>(volumeLevel, 2) + (now - ringStartedAt) / 10000);
+  const uint8_t ramp = std::min<uint32_t>(4, std::max<uint8_t>(alarmLevel, kAlarmFloorLevel) + (now - ringStartedAt) / 10000);
   if (what == Ringing::Alarm && alarmSong == AlarmSong::Playing && (alarmSongHeard || media::state() == media::State::Playing)) {
     // The song rings instead of the beeps, getting louder the same way.
-    M5Cardputer.Speaker.setVolume(kVolumeValues[ramp]);
+    applyMediaVolume(kVolumeValues[ramp]);
     nextRingToneAt = now + 250; return;
   }
   const RingNote *notes = what == Ringing::Alarm ? kAlarmRing : what == Ringing::Timer ? kTimerRing : kScreenRing;
@@ -3798,7 +3865,7 @@ void serviceRingTone(uint32_t now) {
   nextRingToneAt = now + note.ms + note.gapMs;
   messageNotificationPending = false; messageNotificationActive = false;
   if (voiceRecording) return;  // The microphone has the codec; the screen still flashes.
-  M5Cardputer.Speaker.setVolume(kVolumeValues[ramp]); M5Cardputer.Speaker.setChannelVolume(0, 255);
+  applyToneVolume(kVolumeValues[ramp]);
   M5Cardputer.Speaker.tone(note.frequency, note.ms, 0, true);
   lastToneAt = now;
 }
@@ -3825,7 +3892,8 @@ void serviceClockApps() {
     if (!chargingModeActive) {
       bannerWarning = warning; bannerUntil = now + 10000; renderDirty = true;
       if (!voiceRecording) {
-        M5Cardputer.Speaker.setVolume(kVolumeValues[std::max<uint8_t>(volumeLevel, 2)]); M5Cardputer.Speaker.setChannelVolume(0, 255);
+        // A warning is a system sound, at the middle step at least, as before v0.67: it must be heard.
+        applyToneVolume(kVolumeValues[std::max<uint8_t>(systemLevel, 2)]);
         M5Cardputer.Speaker.tone(1319, 150, 0, true); M5Cardputer.Speaker.tone(1760, 250, 0, false);
         lastToneAt = now;
       }
@@ -4535,16 +4603,16 @@ void serviceSleepTimer() {
   const uint32_t now = millis();
   const auto state = media::state();
   // Nothing playing or about to: the timer has nothing left to stop.
-  if (!media::active() && !mediaStarting && !adjacentWanted) { sleepTimer.cancel(); M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]); renderDirty = true; return; }
+  if (!media::active() && !mediaStarting && !adjacentWanted) { sleepTimer.cancel(); applyVolumes(); renderDirty = true; return; }
   if (sleepTimer.expired(now)) {
     if (state == media::State::Playing) { media::togglePause(); savePlace(); }
     sleepTimer.cancel();
-    M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+    applyVolumes();
     Serial.println("SLEEP timer paused playback");
     renderDirty = true; return;
   }
   const uint8_t scale = sleepTimer.fadeScale(now);
-  if (scale < 255 && state == media::State::Playing) M5Cardputer.Speaker.setVolume(static_cast<uint8_t>(kVolumeValues[volumeLevel] * scale / 255));
+  if (scale < 255 && state == media::State::Playing) applyMediaVolume(static_cast<uint8_t>(mediaValue() * scale / 255));
 }
 
 // A book playing between 21:20 and 21:30 on a school night: the sleep timer ends at 21:30, and the
@@ -4562,7 +4630,7 @@ void serviceSchoolNight() {
   if (schoolNightWarnedDay == wall.tm_yday) return;
   schoolNightWarnedDay = static_cast<int16_t>(wall.tm_yday);
   bannerWarning = clockapps::Warning::SchoolNight; bannerUntil = now + 10000; renderDirty = true;
-  M5Cardputer.Speaker.setVolume(kVolumeValues[std::max<uint8_t>(volumeLevel, 2)]); M5Cardputer.Speaker.setChannelVolume(0, 255);
+  applyToneVolume(kVolumeValues[std::max<uint8_t>(systemLevel, 2)]);
   M5Cardputer.Speaker.tone(1319, 150, 0, true); M5Cardputer.Speaker.tone(1760, 250, 0, false);
   lastToneAt = now;
   Serial.println("SCHOOL NIGHT book stops at 21:30");
@@ -4572,7 +4640,7 @@ void startQueuedTrack(uint32_t offsetSeconds) {
   const auto *item = nowPlayingItem();
   if (!item) return;
   // The microphone and the speaker share the audio hardware.
-  M5Cardputer.Mic.end(); M5Cardputer.Speaker.begin(); M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  M5Cardputer.Mic.end(); M5Cardputer.Speaker.begin(); applyVolumes();
   // Give the walkie socket's RAM back before the player asks for its own, and chat's
   // messages too: they are on the card, and come back when playback ends.
   mediaStarting = true;
@@ -4643,7 +4711,7 @@ void stopAlarmSong() {
   if (media::active()) { media::stop(); waitForPlayerIdle(); }
   alarmSong = AlarmSong::None; mediaStarting = false;
   os::setMediaOwner(ownerBeforeAlarmSong);
-  M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  applyVolumes();
   renderDirty = true;
 }
 
@@ -4777,7 +4845,7 @@ void stopMorningAudio() {
   if (morningAudio == MorningAudio::None) return;
   if (media::active()) { media::stop(); waitForPlayerIdle(); }
   morningAudio = MorningAudio::None; mediaStarting = false;
-  M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  applyVolumes();
   renderDirty = true;
   Serial.println("MORNING audio stopped");
 }
@@ -4807,8 +4875,8 @@ void serviceMorningAudio() {
       return;
     }
     M5Cardputer.Mic.end(); M5Cardputer.Speaker.begin();
-    // At least the middle step, as an alarm: the kid just woke up and the volume may be at 0 from last night.
-    M5Cardputer.Speaker.setVolume(kVolumeValues[std::max<uint8_t>(volumeLevel, 2)]); M5Cardputer.Speaker.setChannelVolume(0, 255);
+    // Media, at the middle step at least: the kid just woke up and the volume may be at 0 from last night.
+    applyMediaVolume(mediaChannelValue(std::max<uint8_t>(mediaLevel, kMediaSteps / 2)));
     shrinkChatForPlayback();
     media::playFile(morningAudioFile, 0);
     morningAudio = MorningAudio::Playing; morningAudioAt = now; mediaStarting = false;
@@ -5539,8 +5607,8 @@ bool handleAppKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown
     media::togglePause();
     savePlace();
     if (resuming) armBedtimeSleep();
-  } else if (goUp && volumeLevel < 4) { volumeLevel++; saveVolume(); }
-  else if (goDown && volumeLevel > 0) { volumeLevel--; saveVolume(); }
+  } else if (goUp && mediaLevel < kMediaSteps) { mediaLevel++; saveVolume(); }
+  else if (goDown && mediaLevel > 0) { mediaLevel--; saveVolume(); }
   else if (goLeft || goRight) {
     if (queueCollection == library::Collection::Books) {
       const uint32_t position = media::positionSeconds();
@@ -5553,7 +5621,7 @@ bool handleAppKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown
       else if ((character == 't' || character == 'T') && media::active()) {
         // 15, 30, 45, 60 minutes, then off.
         sleepTimer.set(millis(), sleepTimer.nextStepMs(millis()));
-        M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+        applyVolumes();
       }
       // Each key is the first letter of the word its hint shows: L LYRICS / P PAROLES, F FAVOURITE / A AIME.
       else if (tolower(character) == (frenchUi ? 'e' : 'd') && queueCollection == library::Collection::Music && queueIndex >= 0 && playQueue[queueIndex].onCard) deleteAsked = true;
@@ -5647,8 +5715,14 @@ void handleKeyboard() {
     playNextTone(); renderDirty=true; return;
   }
   if (screenMode == ScreenMode::Volume) {
-    if (goLeft && volumeLevel > 0) { volumeLevel--; saveVolume(); playNextTone(); }
-    else if (goRight && volumeLevel < 4) { volumeLevel++; saveVolume(); playNextTone(); }
+    uint8_t &level = volumeRow == 0 ? alarmLevel : volumeRow == 1 ? systemLevel : mediaLevel;
+    const uint8_t lowest = volumeRow == 0 ? kAlarmFloorLevel : 0, highest = volumeRow == 2 ? kMediaSteps : 4;
+    if (goUp) { if (volumeRow > 0) { volumeRow--; playNextTone(); } else playDeniedTone(); }
+    else if (goDown) { if (volumeRow < 2) { volumeRow++; playNextTone(); } else playDeniedTone(); }
+    else if (goLeft || goRight) {
+      if (goLeft ? level > lowest : level < highest) { level += goLeft ? -1 : 1; saveVolume(); playVolumeSample(volumeRow); }
+      else playDeniedTone();
+    }
     else if (keys.enter) { leaveSettingsScreen(); playNextTone(); }
     renderDirty = true; return;
   }
@@ -5765,7 +5839,7 @@ void setup() {
     rememberWifi(SUPACHAT_HOME_SSID, SUPACHAT_HOME_PSK);
 #endif
   startClock();
-  M5Cardputer.Speaker.setVolume(kVolumeValues[volumeLevel]);
+  applyVolumes();
   sampleBattery(true);
   drawBootSplash();
   uiCanvas.setPsram(false);
