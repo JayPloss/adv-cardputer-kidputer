@@ -7,19 +7,22 @@ from SCons.Script import COMMAND_LINE_TARGETS
 
 
 def _tree_fingerprint(repo, paths):
-    """Everything a gate run depends on in one repo: the committed tree, uncommitted edits, and
-    untracked files (by content), so a pass is reused only for exactly the same code."""
-    def git(*args):
-        return subprocess.run(["git", "-C", repo, *args], capture_output=True, check=False).stdout
+    """Everything a gate run depends on in one repo, by content: every tracked or untracked (not ignored)
+    file under the paths, as it is on disk. A commit or an amend of the same code keeps the pass; the
+    browser mock's screenshots (written by its visual test, never read by the gate) don't count."""
+    names = subprocess.run(["git", "-C", repo, "ls-files", "-co", "--exclude-standard", "-z", "--", *paths],
+                           capture_output=True, check=False).stdout.split(b"\0")
     digest = hashlib.sha256()
-    for path in paths:
-        digest.update(git("rev-parse", f"HEAD:{path}" if path != "." else "HEAD^{tree}"))
-    digest.update(git("diff", "HEAD", "--", *paths))
-    for name in git("ls-files", "--others", "--exclude-standard", "-z", "--", *paths).split(b"\0"):
-        if name:
-            digest.update(name)
-            with open(os.path.join(repo, name.decode()), "rb") as handle:
-                digest.update(hashlib.sha256(handle.read()).digest())
+    for name in sorted(n for n in names if n):
+        text = name.decode()
+        if text.startswith("emulator/screens/"):
+            continue
+        path = os.path.join(repo, text)
+        if not os.path.isfile(path):
+            continue  # deleted but not yet committed
+        digest.update(name + b"\0")
+        with open(path, "rb") as handle:
+            digest.update(hashlib.sha256(handle.read()).digest())
     return digest.hexdigest()
 
 
