@@ -1,0 +1,8 @@
+#!/bin/sh
+# After a commit that changes firmware/ or emulator/, gate the tree in the background (tools/gate/run-gate.py).
+changed=$(git diff-tree --no-commit-id --name-only -r HEAD -- firmware emulator | head -1)
+[ -n "$changed" ] || exit 0
+root=$(git rev-parse --show-toplevel)
+mkdir -p "$root/firmware/.pio"
+nohup python3 -I "$root/tools/gate/run-gate.py" > "$root/firmware/.pio/gate-background.log" 2>&1 &
+echo "Upload gate started in the background: firmware/.pio/gate-background.log"
