@@ -57,13 +57,11 @@ NOT_EMULATED_SCENARIOS = {
 }
 
 
-# Scenarios that talk to the real music server over the real network (cardputer-emulator README). A failure
-# there can be the network, not the firmware: the gate runs it once more, and check.py skips it, saying so,
-# when the server doesn't answer at all.
-# notify-reboot too: the build's card sync reaches the real server, and a slow one holds the one secure
-# connection, so chat's message comes late (Juju's flash, 2026-11-25: held over 80 s).
-# places waits for the card to be free to write its brightness log, which a card sync can hold.
-NETWORK_SCENARIOS = {"stream", "card-sync", "notify-reboot", "places"}
+# Scenarios that talk to the real music server over the real network (cardputer-emulator README). They test
+# the network as much as the firmware, so they run as a report: a failure is printed, never blocks a flash
+# (Jay, 2026-11-25, after a dropped connection blocked Juju's). notify-reboot is one: the build's card sync
+# reaches the real server and can hold chat's one secure connection past the scenario's wait.
+REPORT_ONLY_SCENARIOS = {"stream", "card-sync", "notify-reboot"}
 
 
 def runtime_scenarios(runtime):
@@ -160,21 +158,20 @@ def run_device_contract_gate(source, target, env):
         for name, why in NOT_EMULATED_SCENARIOS.items():
             print(f"  - scenario {name} skipped: {why}")
         todo = [name for name in runtime_scenarios(runtime) if not ledger.done("scenario:" + name)]
-        failed = []
+        failed, reported = [], []
         if todo:
-            results = run_scenarios(runtime, repo, todo)
-            # The network ones that failed get one more run before they count.
-            again = [name for name, result in results.items() if result == "FAIL" and name in NETWORK_SCENARIOS]
-            if again:
-                print(f"Upload gate: {', '.join(again)} talk to the real music server; running them once more.")
-                results.update(run_scenarios(runtime, repo, again))
-            for name, result in results.items():
-                if result == "FAIL":
+            for name, result in run_scenarios(runtime, repo, todo).items():
+                if result == "FAIL" and name in REPORT_ONLY_SCENARIOS:
+                    reported.append(name)
+                elif result == "FAIL":
                     failed.append(name)
-                else:
-                    if result == "SKIPPED":
-                        print(f"Upload gate: not covered this run: scenario {name} (skipped by check.py)")
-                    ledger.add("scenario:" + name)
+                    continue
+                elif result == "SKIPPED":
+                    print(f"Upload gate: not covered this run: scenario {name} (skipped by check.py)")
+                ledger.add("scenario:" + name)
+        for name in reported:
+            print(f"Upload gate REPORT: {name} failed; it talks to the real music server, so it doesn't block the flash. "
+                  f"Its log: cardputer-emulator/run/{name}/log.txt")
         if failed:
             raise RuntimeError(f"Firmware upload blocked by emulator gate: scenario {', '.join(failed)} failed; "
                                f"the {len(ledger.passed)} checks that passed won't run again for this code")
