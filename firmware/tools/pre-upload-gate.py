@@ -60,7 +60,9 @@ NOT_EMULATED_SCENARIOS = {
 # Scenarios that talk to the real music server over the real network (cardputer-emulator README). A failure
 # there can be the network, not the firmware: the gate runs it once more, and check.py skips it, saying so,
 # when the server doesn't answer at all.
-NETWORK_SCENARIOS = {"stream", "card-sync"}
+# notify-reboot too: the build's card sync reaches the real server, and a slow one holds the one secure
+# connection, so chat's message comes late (Juju's flash, 2026-11-25: held over 80 s).
+NETWORK_SCENARIOS = {"stream", "card-sync", "notify-reboot"}
 
 
 def runtime_scenarios(runtime):
