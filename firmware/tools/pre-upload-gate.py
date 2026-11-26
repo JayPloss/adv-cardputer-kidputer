@@ -207,7 +207,7 @@ def backup_device_settings(source, target, env):
     read = subprocess.run(esptool + ["--baud", "921600", "--before", "no_reset", "--after", "no_reset",
                                      "read_flash", "0x9000", "0x5000", out], capture_output=True, text=True)
     if read.returncode or not os.path.exists(out) or os.path.getsize(out) != 0x5000:
-        raise RuntimeError(f"Settings backup: reading settings from {name} ({mac}) failed; flash blocked.\n{read.stderr}")
+        raise RuntimeError(f"Settings backup: reading settings from {name} ({mac}) failed; flash blocked.\n{read.stdout[-1500:]}{read.stderr}")
     os.chmod(out, 0o600)
     print(f"Settings backup: {name} ({mac}) saved to {out}")
 
