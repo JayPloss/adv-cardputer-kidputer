@@ -62,7 +62,8 @@ NOT_EMULATED_SCENARIOS = {
 # when the server doesn't answer at all.
 # notify-reboot too: the build's card sync reaches the real server, and a slow one holds the one secure
 # connection, so chat's message comes late (Juju's flash, 2026-11-25: held over 80 s).
-NETWORK_SCENARIOS = {"stream", "card-sync", "notify-reboot"}
+# places waits for the card to be free to write its brightness log, which a card sync can hold.
+NETWORK_SCENARIOS = {"stream", "card-sync", "notify-reboot", "places"}
 
 
 def runtime_scenarios(runtime):

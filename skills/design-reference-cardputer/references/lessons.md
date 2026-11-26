@@ -71,3 +71,8 @@ Each item says where it came from. Add to this list; don't delete from it unless
 ## HOME (v0.65)
 
 - **A new app takes the place of the one used least, not a slot that shifts every tile after it.** CLOCK went beside TIMER and ALARM (Albie, 2026-11-22), and SCREEN moved to a fifth page of its own, so every other tile kept the position the kids' thumbs know. The last page may be short: its empty tiles aren't drawn, Up or Down onto one bumps, and Right from either row lands on its last tile.
+
+## Brightness and places (v0.68)
+
+- **A label one letter past a tile gets a shorter word, and the screen's header says it in full.** BRIGHTNESS is 10 letters; the tile is BRIGHT (LUMIERE) and the header BRIGHTNESS (LUMINOSITE). They filled HOME's short last page, so no tile moved.
+- **A header title runs into the network word at x=106.** "AJOUTER A UN LIEU" (17 letters at x1) reached it on the runtime emulator's shot; a header holds 16 letters at most. Long titles go in the screen's first line instead (2026-11-25, `places-fr`).

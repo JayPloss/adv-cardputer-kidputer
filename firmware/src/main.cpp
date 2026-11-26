@@ -13,6 +13,7 @@
 #endif
 #include "apps/chat/fox_finding.h"
 #include "apps/system/french_keyboard.h"
+#include "apps/system/places.h"
 #include "apps/chat/outbox.h"
 #include "apps/chat/voice_codec.h"
 #include <WebSocketsClient.h>
@@ -87,7 +88,7 @@ const char *failureText(const char *english) {
   if (frenchUi) for (const auto &pair : kFrench) if (!strcmp(english, pair[0])) return pair[1];
   return english;
 }
-constexpr char kFirmwareVersion[] = "v0.67";
+constexpr char kFirmwareVersion[] = "v0.68";
 // The author of the device's own notes to its owner: no account has this id.
 constexpr char kNoticeAuthor[] = "kidputer";
 // Lyrics show only when asked for: L (lyrics) in English, P (paroles) in French, turns them on and off; remembered.
@@ -323,7 +324,7 @@ struct ListsLock {
   ~ListsLock() { xSemaphoreGive(sharedListsMutex); }
 };
 
-enum class ScreenMode { Chat, Menu, Rooms, Volume, Language, EmojiRecipes, Changelog, VoiceMessages, Walkie, Status, Networks, NetworkPassword, ChargingConfirm, Charging, FoxFinding, Home, Library, LibrarySearch, NowPlaying, Remote, System, Timer, Alarm, ScreenTime, Stopwatch, KeyHelp, Morning, Agenda };
+enum class ScreenMode { Chat, Menu, Rooms, Volume, Language, EmojiRecipes, Changelog, VoiceMessages, Walkie, Status, Networks, NetworkPassword, ChargingConfirm, Charging, FoxFinding, Home, Library, LibrarySearch, NowPlaying, Remote, System, Timer, Alarm, ScreenTime, Stopwatch, KeyHelp, Morning, Agenda, Brightness, Places, PlacePick, PlaceName };
 
 Preferences preferences;
 M5Canvas uiCanvas(&M5Cardputer.Display);
@@ -411,6 +412,13 @@ uint8_t mediaLevel = kDefaultMediaLevel;    // 0..kMediaSteps
 uint8_t systemLevel = kDefaultSystemLevel;  // 0..4
 uint8_t alarmLevel = kDefaultAlarmLevel;    // kAlarmFloorLevel..4
 int volumeRow = 2;                          // the VOLUME screen's row: 0 ALARM, 1 SYSTEM, 2 MEDIA
+// Screen brightness (v0.68, Albie): five levels, set by hand. The lowest stays readable in the dark.
+constexpr uint8_t kBrightnessValues[] = {20, 50, 100, 170, 255};
+constexpr uint8_t kBrightnessLevels = sizeof(kBrightnessValues);
+uint8_t brightnessLevel = kBrightnessLevels - 1;
+uint8_t brightnessOpenedAt = kBrightnessLevels - 1;  // the level when the screen opened, for the log
+String brightnessLogPending;                          // a change waiting for the card (see serviceBrightnessLog)
+uint8_t userBrightness() { return kBrightnessValues[brightnessLevel]; }
 uint8_t mediaChannelValue(uint8_t level) { return static_cast<uint8_t>((static_cast<uint16_t>(level) * 255 + kMediaSteps / 2) / kMediaSteps); }
 uint8_t mediaValue() { return mediaChannelValue(mediaLevel); }
 uint8_t systemValue() { return kVolumeValues[systemLevel]; }
@@ -1038,6 +1046,7 @@ void loadConfiguration() {
   mediaLevel = std::min<uint8_t>(preferences.getUChar("vol_media", kDefaultMediaLevel), kMediaSteps);
   systemLevel = std::min<uint8_t>(preferences.getUChar("vol_system", kDefaultSystemLevel), 4);
   alarmLevel = std::max<uint8_t>(kAlarmFloorLevel, std::min<uint8_t>(preferences.getUChar("vol_alarm", kDefaultAlarmLevel), 4));
+  brightnessLevel = std::min<uint8_t>(preferences.getUChar("bright", kBrightnessLevels - 1), kBrightnessLevels - 1);
   persistedBatteryLevel = preferences.getInt("battery_soc", -1);
   lyricsWanted = preferences.getBool("lyrics", false);
   shuffleOn = preferences.getBool("play_mix", false);
@@ -1087,8 +1096,170 @@ void saveVolume() {
   preferences.putUChar("vol_media", mediaLevel);
   preferences.putUChar("vol_system", systemLevel);
   preferences.putUChar("vol_alarm", alarmLevel);
+  preferences.putUChar("bright", brightnessLevel);
   preferences.end();
   applyVolumes();
+}
+
+int64_t clockNowS();
+// ---- Places (v0.68; firmware/src/apps/system/places.h) ----
+// Names, parents and print counts in NVS namespace "places" as one blob ("list"); each print in its own
+// blob ("p<slot>_<n>"), read only when a scan is judged, so the prints cost no RAM.
+places::Place placeList[places::kMaxPlaces];
+volatile bool placesSaved = false;     // any place: the network task scans for recognition only then
+int herePlace = -1, hereSub = -1;      // where the last judged scan was
+bool placeJudged = false;              // a scan has been judged since boot
+// The network task scans (it owns the radio); the loop judges. placeScan is written under stateMutex.
+constexpr uint32_t kPlaceScanMs = 5 * 60000u;
+volatile bool placeScanWanted = false;
+volatile uint32_t placeScanSeq = 0;
+uint32_t placeScanJudged = 0;
+uint32_t lastPlaceScanAt = 0;
+places::Print placeScan;
+int placeScanNetworks = 0;             // access points the last scan saw, before trimming
+// The PLACES screens.
+int placesRow = 0;                     // 0 SAVE THIS PLACE, 1 ADD TO A PLACE
+int placePickRow = 0;
+bool placeDeleteAsked = false;
+int placeParent = -1;                  // the name being typed: a new place (-1) or a part of this one
+String placeName;
+bool placeSaveWaiting = false;         // Enter came before the scan: save when it arrives
+uint32_t placeScanAskedSeq = 0;        // the scan the name screen waits for is the one after this
+uint32_t placeScanAskedAt = 0;
+String placeNotice;
+bool placeNoticeGood = false;
+
+struct PlaceRecord { char name[places::kNameBytes]; int8_t parent; uint8_t prints; };
+
+void savePlaceList() {
+  PlaceRecord records[places::kMaxPlaces];
+  for (int i = 0; i < places::kMaxPlaces; i++) {
+    memcpy(records[i].name, placeList[i].name, places::kNameBytes);
+    records[i].parent = placeList[i].parent; records[i].prints = placeList[i].prints;
+  }
+  Preferences store;
+  if (!store.begin("places", false)) return;
+  store.putBytes("list", records, sizeof(records));
+  store.end();
+  bool any = false;
+  for (const auto &place : placeList) any = any || place.used();
+  placesSaved = any;
+}
+
+void loadPlaces() {
+  PlaceRecord records[places::kMaxPlaces];
+  Preferences store;
+  if (!store.begin("places", true)) return;
+  const size_t got = store.getBytesLength("list") == sizeof(records) ? store.getBytes("list", records, sizeof(records)) : 0;
+  store.end();
+  if (got != sizeof(records)) return;
+  bool any = false;
+  for (int i = 0; i < places::kMaxPlaces; i++) {
+    memcpy(placeList[i].name, records[i].name, places::kNameBytes);
+    placeList[i].name[places::kNameBytes - 1] = 0;
+    placeList[i].parent = records[i].parent; placeList[i].prints = std::min<uint8_t>(records[i].prints, places::kMaxPrints);
+    any = any || placeList[i].used();
+  }
+  placesSaved = any;
+}
+
+String printKey(int slot, int which) { return "p" + String(slot) + "_" + String(which); }
+
+bool readPlacePrint(int slot, int which, places::Print &out) {
+  Preferences store;
+  if (!store.begin("places", true)) return false;
+  const String key = printKey(slot, which);
+  const bool ok = store.getBytesLength(key.c_str()) == sizeof(out) && store.getBytes(key.c_str(), &out, sizeof(out)) == sizeof(out);
+  store.end();
+  return ok;
+}
+
+void writePlacePrint(int slot, int which, const places::Print &print) {
+  Preferences store;
+  if (!store.begin("places", false)) return;
+  store.putBytes(printKey(slot, which).c_str(), &print, sizeof(print));
+  store.end();
+}
+
+// A place and its sub-places, with their prints.
+void deletePlace(int slot) {
+  if (slot < 0 || slot >= places::kMaxPlaces || !placeList[slot].used()) return;
+  Preferences store;
+  for (int i = 0; i < places::kMaxPlaces; i++) {
+    if (i != slot && placeList[i].parent != slot) continue;
+    if (!placeList[i].used()) continue;
+    if (store.begin("places", false)) { for (int w = 0; w < places::kMaxPrints; w++) store.remove(printKey(i, w).c_str()); store.end(); }
+    Serial.printf("PLACES deleted %s\n", placeList[i].name);
+    placeList[i] = places::Place();
+    if (herePlace == i) herePlace = -1;
+    if (hereSub == i) hereSub = -1;
+  }
+  savePlaceList();
+}
+
+String placeText(int place, int sub) {
+  if (place < 0) return "";
+  String text = placeList[place].name;
+  if (sub >= 0) { text += " / "; text += placeList[sub].name; }
+  return text;
+}
+
+// Network task: a scan when a screen asks for one, and every kPlaceScanMs once any place is saved. The
+// radio is on here (the caller checked); not connected, the channel ESP-NOW uses is put back after.
+void servicePlaceScan() {
+  const bool wanted = placeScanWanted;
+  if (!wanted && !(placesSaved && millis() - lastPlaceScanAt >= kPlaceScanMs)) return;
+  lastPlaceScanAt = millis();
+  uint8_t primary = kEspNowFallbackChannel; wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
+  esp_wifi_get_channel(&primary, &secondary);
+  int count = WiFi.scanNetworks(false, true, false, 120);
+  places::ScanBuilder builder;
+  for (int index = 0; index < count; index++) {
+    const uint8_t *bssid = WiFi.BSSID(index);
+    if (bssid) builder.add(bssid, WiFi.RSSI(index), WiFi.SSID(index).c_str());
+  }
+  WiFi.scanDelete();
+  if (WiFi.status() != WL_CONNECTED) esp_wifi_set_channel(primary, secondary);
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  placeScan = builder.print; placeScanNetworks = std::max(0, count); placeScanSeq = placeScanSeq + 1;
+  xSemaphoreGive(stateMutex);
+  if (wanted) placeScanWanted = false;
+  Serial.printf("PLACES scan: %d networks, %u kept\n", std::max(0, count), builder.print.count);
+}
+
+// Loop: judges a new scan. Returns true when there was one.
+bool judgePlaceScan() {
+  if (placeScanSeq == placeScanJudged) return false;
+  places::Print scan;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  scan = placeScan; placeScanJudged = placeScanSeq;
+  xSemaphoreGive(stateMutex);
+  const places::Where where = places::recognise(placeList, scan, herePlace, readPlacePrint);
+  if (where.place != herePlace || where.sub != hereSub || !placeJudged)
+    Serial.printf("PLACES here: %s (%.2f, %.2f)\n", where.place >= 0 ? placeText(where.place, where.sub).c_str() : "-", where.placeScore, where.subScore);
+  herePlace = where.place; hereSub = where.sub; placeJudged = true;
+  renderDirty = true;
+  return true;
+}
+
+// The brightness log: utc_s,local,from,to,place. Written when the card is free (not while the player
+// reads it), to look later for habits by time and place.
+void serviceBrightnessLog() {
+  if (brightnessLogPending.isEmpty() || !sdReady || media::active() || library::cardSyncRunning()) return;
+  File log = SD.open("/supachat-brightness.csv", FILE_APPEND);
+  if (log) { log.print(brightnessLogPending); log.close(); }
+  brightnessLogPending = "";
+}
+
+void logBrightnessChange(uint8_t from, uint8_t to) {
+  struct tm wall{};
+  char local[8] = "";
+  if (getLocalTime(&wall, 10)) snprintf(local, sizeof(local), "%02d:%02d", wall.tm_hour, wall.tm_min);
+  String place = herePlace >= 0 ? placeText(herePlace, hereSub) : String("");
+  place.replace(",", " ");
+  if (brightnessLogPending.length() < 1024)
+    brightnessLogPending += String(static_cast<long>(clockNowS())) + "," + local + "," + String(from + 1) + "," + String(to + 1) + "," + place + "\n";
+  Serial.printf("BRIGHTNESS %u -> %u at %s %s\n", from + 1, to + 1, local, place.c_str());
 }
 
 void saveWifiProfiles() {
@@ -2006,7 +2177,7 @@ void exitChargingMode() {
   chargingModeActive = false;
   inputQuarantined = true;
   setCpuFrequencyMhz(240);
-  M5Cardputer.Display.setBrightness(255);
+  M5Cardputer.Display.setBrightness(userBrightness());
   M5Cardputer.Speaker.begin(); applyVolumes();
   WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(false); WiFi.persistent(false); WiFi.disconnect(false, false);
   if (kEspNowEnabled) initializeEspNow();
@@ -2489,6 +2660,8 @@ void networkTask(void *) {
     }
     if (manualWifiMode) { networkTaskParked = true; vTaskDelay(pdMS_TO_TICKS(100)); continue; }
     networkTaskParked = false;
+    if (!localOnlyMode) servicePlaceScan();
+    else if (placeScanWanted) placeScanWanted = false;  // local mode keeps the radio to ESP-NOW
     if (localOnlyMode) {
       if (WiFi.status() == WL_CONNECTED) WiFi.disconnect(false, false);
       if (currentSsid.length() || networkStatus != "ESPNOW LOCAL") {
@@ -2867,6 +3040,147 @@ void drawWalkie() {
   }
 }
 
+// BRIGHTNESS (v0.68, Albie): five levels by hand, Left and Right, shown at once.
+void drawBrightness() {
+  auto &display = uiCanvas; display.fillScreen(TFT_BLACK); drawHeader(uiText("BRIGHTNESS", "LUMINOSITE"));
+  display.setTextSize(2); display.setTextColor(TFT_YELLOW, TFT_BLACK);
+  const String value = String(brightnessLevel + 1) + "/" + String(kBrightnessLevels);
+  display.setCursor(120 - static_cast<int>(value.length()) * 6, 36); display.print(value);
+  for (int index = 0; index < kBrightnessLevels; index++)
+    display.fillRoundRect(20 + index * 42, 66, 30, 20, 4, index <= brightnessLevel ? TFT_YELLOW : TFT_DARKGREY);
+  display.setTextSize(1); display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.setCursor(6, 111); display.print(uiText("LEFT/RIGHT CHANGE", "GAUCHE/DROITE REGLER"));
+  display.setCursor(6, 123); display.print(uiText("OK BACK", "OK RETOUR"));
+}
+
+void drawPlaceNotice(int y) {
+  if (placeNotice.isEmpty()) return;
+  auto &display = uiCanvas;
+  display.setTextSize(1); display.setTextColor(placeNoticeGood ? TFT_GREEN : TFT_RED, TFT_BLACK);
+  display.setCursor(6, y); printFont0Text(utf8Head(placeNotice, 38));
+}
+
+// PLACES (v0.68): where the device is, and the two ways to teach it a place.
+void drawPlaces() {
+  auto &display = uiCanvas; display.fillScreen(TFT_BLACK); drawHeader(uiText("PLACES", "LIEUX"));
+  display.setTextSize(1); display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(8, 25); display.print(uiText("HERE", "ICI"));
+  display.setTextSize(2); display.setCursor(8, 35);
+  if (herePlace >= 0) { display.setTextColor(TFT_YELLOW, TFT_BLACK); printFont0Text(utf8Head(placeText(herePlace, hereSub), 19)); }
+  else {
+    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    display.print(!placesSaved ? uiText("NO PLACES YET", "AUCUN LIEU") : !placeJudged ? uiText("LOOKING...", "RECHERCHE...") : uiText("NOT A SAVED PLACE", "LIEU INCONNU"));
+  }
+  const char *rows[] = {uiText("SAVE THIS PLACE", "ENREGISTRER ICI"), uiText("ADD TO A PLACE", "AJOUTER A UN LIEU")};
+  for (int row = 0; row < 2; row++) {
+    const int y = 58 + row * 24;
+    const bool chosen = row == placesRow;
+    display.fillRoundRect(4, y, 232, 22, 4, chosen ? TFT_DARKGREEN : TFT_BLACK);
+    if (chosen) display.drawRoundRect(4, y, 232, 22, 4, TFT_YELLOW);
+    display.setTextSize(2); display.setTextColor(chosen ? TFT_YELLOW : TFT_WHITE, chosen ? TFT_DARKGREEN : TFT_BLACK);
+    display.setCursor(10, y + 4); display.print(rows[row]);
+  }
+  drawPlaceNotice(109);
+  display.setTextSize(1); display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.setCursor(6, 123); display.print(uiText("UP/DOWN  ENTER OK  MENU BACK", "HAUT/BAS  ENTER OK  MENU RETOUR"));
+}
+
+// ADD TO A PLACE: the saved places, their parts indented under them. Enter on a place names a new part
+// of it; DEL deletes the row chosen (a place with its parts), after Enter confirms.
+int placePickCount() { int n = 0; for (int i = 0; i < places::kMaxPlaces; i++) if (placeList[i].used() && placeList[i].parent < 0) { n++; for (int c = 0; c < places::kMaxPlaces; c++) if (placeList[c].used() && placeList[c].parent == i) n++; } return n; }
+int placePickSlot(int row) {
+  int n = 0;
+  for (int i = 0; i < places::kMaxPlaces; i++) {
+    if (!placeList[i].used() || placeList[i].parent >= 0) continue;
+    if (n++ == row) return i;
+    for (int c = 0; c < places::kMaxPlaces; c++) if (placeList[c].used() && placeList[c].parent == i && n++ == row) return c;
+  }
+  return -1;
+}
+
+void drawPlacePick() {
+  auto &display = uiCanvas; display.fillScreen(TFT_BLACK); drawHeader(uiText("ADD TO", "AJOUTER A"));  // the header's network word starts at x=106
+  const int count = placePickCount();
+  if (!count) {
+    display.setTextSize(2); display.setTextColor(TFT_LIGHTGREY, TFT_BLACK); display.setCursor(8, 40); display.print(uiText("NO PLACES YET", "AUCUN LIEU"));
+  }
+  placePickRow = std::max(0, std::min(placePickRow, count - 1));
+  const int first = std::max(0, std::min(placePickRow - 1, count - 4));
+  for (int row = first; row < count && row < first + 4; row++) {
+    const int slot = placePickSlot(row), y = 23 + (row - first) * 21;
+    const bool chosen = row == placePickRow, sub = placeList[slot].parent >= 0;
+    const uint16_t back = chosen ? (placeDeleteAsked ? TFT_RED : TFT_DARKGREEN) : TFT_BLACK;
+    display.fillRoundRect(4, y, 232, 20, 4, back);
+    display.setTextSize(2); display.setTextColor(chosen ? TFT_YELLOW : sub ? TFT_LIGHTGREY : TFT_WHITE, back);
+    display.setCursor(sub ? 34 : 10, y + 3); printFont0Text(utf8Head(placeList[slot].name, sub ? 16 : 18));
+  }
+  display.setTextSize(1);
+  if (placeDeleteAsked && count) {
+    display.setTextColor(TFT_RED, TFT_BLACK); display.setCursor(6, 110);
+    display.print(uiText("DELETE IT? ENTER YES, OTHER KEY NO", "EFFACER? ENTER OUI, AUTRE TOUCHE NON"));
+  } else drawPlaceNotice(110);
+  display.setTextSize(1); display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 123);
+  display.print(uiText("ENTER CHOOSE  DEL DELETE  MENU BACK", "ENTER CHOISIR DEL EFFACER MENU RETOUR"));
+}
+
+// The name of a new place, or of a new part of one. The scan asked for on the way here fills the print.
+void drawPlaceName() {
+  auto &display = uiCanvas; display.fillScreen(TFT_BLACK);
+  if (placeParent < 0) drawHeader(uiText("NEW PLACE", "NOUVEAU LIEU"));
+  else drawHeader(uiText("NEW PART", "PARTIE"));
+  display.setTextSize(1); display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(8, 26);
+  if (placeParent >= 0) { display.print(uiText("PART OF ", "DANS ")); printFont0Text(utf8Head(placeList[placeParent].name, 28)); }
+  else display.print(uiText("NAME OF THIS PLACE", "NOM DE CE LIEU"));
+  display.fillRoundRect(4, 40, 232, 26, 4, TFT_DARKGREY);
+  display.setTextSize(2); display.setTextColor(TFT_WHITE, TFT_DARKGREY); display.setCursor(10, 46);
+  printFont0Text(placeName); display.print("_");
+  display.setTextSize(1); display.setCursor(8, 76);
+  const bool scanned = placeScanSeq != placeScanAskedSeq;
+  if (!scanned) { display.setTextColor(TFT_LIGHTGREY, TFT_BLACK); display.print(uiText("LOOKING AT THE WI-FI AROUND...", "JE REGARDE LE WI-FI AUTOUR...")); }
+  else if (!placeScan.count) { display.setTextColor(TFT_RED, TFT_BLACK); display.print(uiText("NO WI-FI HERE: CAN'T SAVE", "PAS DE WI-FI ICI: IMPOSSIBLE")); }
+  else { display.setTextColor(TFT_GREEN, TFT_BLACK); display.printf(frenchUi ? (placeScanNetworks == 1 ? "%d RESEAU AUTOUR" : "%d RESEAUX AUTOUR") : (placeScanNetworks == 1 ? "%d NETWORK AROUND" : "%d NETWORKS AROUND"), placeScanNetworks); }
+  drawPlaceNotice(96);
+  display.setTextSize(1); display.setTextColor(TFT_DARKGREY, TFT_BLACK); display.setCursor(6, 123);
+  display.print(uiText("TYPE  ENTER SAVE  MENU CANCEL", "TAPER ENTER GARDER MENU ANNULER"));
+}
+
+// ---- PLACES: saving ----
+void askPlaceScan() { placeScanAskedSeq = placeScanSeq; placeScanAskedAt = millis(); placeScanWanted = true; }
+void setPlaceNotice(const String &text, bool good) { placeNotice = text; placeNoticeGood = good; }
+
+void savePlaceNow() {
+  placeSaveWaiting = false;
+  places::Print scan;
+  xSemaphoreTake(stateMutex, portMAX_DELAY); scan = placeScan; xSemaphoreGive(stateMutex);
+  if (!scan.count) { setPlaceNotice(uiText("NO WI-FI HERE: NOT SAVED", "PAS DE WI-FI ICI: PAS GARDE"), false); return; }
+  const int slot = places::freeSlot(placeList);
+  if (slot < 0) { setPlaceNotice(uiText("12 PLACES ALREADY: DELETE ONE", "DEJA 12 LIEUX: EFFACES-EN UN"), false); return; }
+  String name = placeName; name.trim();
+  places::Place place;
+  strncpy(place.name, name.c_str(), places::kNameBytes - 1);
+  place.parent = static_cast<int8_t>(placeParent); place.prints = 1;
+  placeList[slot] = place;
+  writePlacePrint(slot, 0, scan);
+  savePlaceList();
+  if (placeParent >= 0) { herePlace = placeParent; hereSub = slot; } else { herePlace = slot; hereSub = -1; }
+  placeJudged = true;
+  Serial.printf("PLACES saved %s (%u access points)\n", placeText(herePlace, hereSub).c_str(), scan.count);
+  setPlaceNotice(String(uiText("SAVED: ", "GARDE: ")) + placeText(herePlace, hereSub), true);
+  placesRow = 0; screenMode = ScreenMode::Places; renderDirty = true;
+}
+
+// Loop: a save waiting for its scan, and a scan that never came.
+void servicePlaceSave() {
+  if (screenMode != ScreenMode::PlaceName) return;
+  const bool scanned = placeScanSeq != placeScanAskedSeq;
+  if (placeSaveWaiting && scanned) { savePlaceNow(); return; }
+  if (!scanned && millis() - placeScanAskedAt > 20000) {
+    placeSaveWaiting = false; placeScanAskedAt = millis();
+    setPlaceNotice(localOnlyMode ? uiText("LOCAL MODE: NO WI-FI SCAN", "MODE LOCAL: PAS DE WI-FI") : uiText("WI-FI SCAN FAILED: TRYING AGAIN", "SCAN WI-FI RATE: J'ESSAIE ENCORE"), false);
+    if (!localOnlyMode) placeScanWanted = true;
+    renderDirty = true;
+  }
+}
+
 String volumeValueText(int row) {
   if (row == 2) return mediaLevel == 0 ? String(uiText("MUTE", "MUET")) : String(mediaLevel) + "/" + String(kMediaSteps);
   const uint8_t level = row == 0 ? alarmLevel : systemLevel;
@@ -3058,7 +3372,7 @@ void drawFoxFinding() {
 }
 
 // HOME and its apps. SUPACHAT is the existing chat; the others live below.
-enum class AppId : uint8_t { Chat, Music, Books, Remote, Timer, Alarm, Clock, ScreenTime, Stopwatch, Wifi, Volume, Status, Language, Charging, Local, Changelog, System, Agenda };
+enum class AppId : uint8_t { Chat, Music, Books, Remote, Timer, Alarm, Clock, ScreenTime, Stopwatch, Wifi, Volume, Status, Language, Charging, Local, Changelog, System, Agenda, Brightness, Places };
 struct HomeApp { AppId id; const char *english; const char *french; };
 // Pages of four, in order. A label fits a tile at 9 characters: see design-reference-cardputer.
 constexpr HomeApp kHomeApps[] = {{AppId::Chat, "SUPACHAT", "SUPACHAT"}, {AppId::Music, "MUSIC", "MUSIQUE"}, {AppId::Books, "BOOKS", "LIVRES"}, {AppId::Remote, "R/C", "R/C"},
@@ -3068,7 +3382,10 @@ constexpr HomeApp kHomeApps[] = {{AppId::Chat, "SUPACHAT", "SUPACHAT"}, {AppId::
                                  // Screen time made room for CLOCK beside TIMER and ALARM (Albie, 2026-11-22); the other tiles kept their places.
                                  {AppId::ScreenTime, "SCREEN", "ECRAN"},
                                  // The morning's agenda, to re-read after the alarm (v0.66): on the short page, so no tile moves.
-                                 {AppId::Agenda, "AGENDA", "AGENDA"}};
+                                 {AppId::Agenda, "AGENDA", "AGENDA"},
+                                 // Brightness (Albie) and places (v0.68) fill the short page: no tile moves. BRIGHTNESS is 10
+                                 // letters, one past a tile, so the tile says BRIGHT and the screen's header says it in full.
+                                 {AppId::Brightness, "BRIGHT", "LUMIERE"}, {AppId::Places, "PLACES", "LIEUX"}};
 constexpr int kHomeAppCount = sizeof(kHomeApps) / sizeof(kHomeApps[0]);
 constexpr int kHomeAppsPerPage = 4;
 // The last page may be short: its empty tiles aren't drawn, and a move onto one bumps.
@@ -3978,7 +4295,7 @@ void serviceIdleClock() {
   if (!idleClockAllowed()) { setIdleClock(false); return; }
   // At bedtime it dims to the charging screen's level.
   struct tm wall{};
-  const uint8_t brightness = wallClock(wall) && clockapps::isBedtime(wall.tm_hour) ? kChargeBrightness : brightnessBeforeIdle;
+  const uint8_t brightness = wallClock(wall) && clockapps::isBedtime(wall.tm_hour) ? std::min(kChargeBrightness, brightnessBeforeIdle) : brightnessBeforeIdle;
   if (M5Cardputer.Display.getBrightness() != brightness) M5Cardputer.Display.setBrightness(brightness);
   if (now - lastRenderAt >= 1000) renderDirty = true;
 }
@@ -4252,7 +4569,8 @@ void render() {
   else if (screenMode == ScreenMode::ScreenTime) drawScreenTime(); else if (screenMode == ScreenMode::Stopwatch) drawStopwatch();
   else if (screenMode == ScreenMode::Morning) drawMorning(); else if (screenMode == ScreenMode::Agenda) drawAgenda();
   else if (screenMode == ScreenMode::Chat) drawChat(); else if (screenMode == ScreenMode::Menu) drawMenu(); else if (screenMode == ScreenMode::Rooms) drawRooms();
-  else if (screenMode == ScreenMode::Volume) drawVolume(); else if (screenMode == ScreenMode::Language) drawLanguage(); else if (screenMode == ScreenMode::Changelog) drawChangelog();
+  else if (screenMode == ScreenMode::Volume) drawVolume(); else if (screenMode == ScreenMode::Brightness) drawBrightness();
+  else if (screenMode == ScreenMode::Places) drawPlaces(); else if (screenMode == ScreenMode::PlacePick) drawPlacePick(); else if (screenMode == ScreenMode::PlaceName) drawPlaceName(); else if (screenMode == ScreenMode::Language) drawLanguage(); else if (screenMode == ScreenMode::Changelog) drawChangelog();
   else if (screenMode == ScreenMode::EmojiRecipes) drawEmojiRecipes();
   else if (screenMode == ScreenMode::KeyHelp) drawKeyHelp();
   else if (screenMode == ScreenMode::VoiceMessages || screenMode == ScreenMode::Walkie) drawWalkie();
@@ -5387,6 +5705,8 @@ void openHomeApp(int index) {
     screenMode = ScreenMode::Networks; scanForNetworks();
   }
   else if (app == AppId::Volume) screenMode = ScreenMode::Volume;
+  else if (app == AppId::Brightness) { brightnessOpenedAt = brightnessLevel; screenMode = ScreenMode::Brightness; }
+  else if (app == AppId::Places) { placesRow = 0; placeNotice = ""; placeScanWanted = true; screenMode = ScreenMode::Places; }
   else if (app == AppId::Status) screenMode = ScreenMode::Status;
   else if (app == AppId::Language) screenMode = ScreenMode::Language;
   else if (app == AppId::Charging) screenMode = ScreenMode::ChargingConfirm;
@@ -5399,11 +5719,16 @@ void openHomeApp(int index) {
 // The device's settings: apps on HOME, each going back to it.
 bool isSettingsScreen() {
   return screenMode == ScreenMode::Networks || screenMode == ScreenMode::NetworkPassword || screenMode == ScreenMode::Volume || screenMode == ScreenMode::Status ||
-         screenMode == ScreenMode::Language || screenMode == ScreenMode::ChargingConfirm || screenMode == ScreenMode::Changelog;
+         screenMode == ScreenMode::Language || screenMode == ScreenMode::ChargingConfirm || screenMode == ScreenMode::Changelog ||
+         screenMode == ScreenMode::Brightness || screenMode == ScreenMode::Places || screenMode == ScreenMode::PlacePick || screenMode == ScreenMode::PlaceName;
 }
 
 void leaveSettingsScreen() {
   if (screenMode == ScreenMode::NetworkPassword) { networkPassword = ""; screenMode = ScreenMode::Networks; return; }
+  // Places go back one level: the name to where it came from, the list to PLACES.
+  if (screenMode == ScreenMode::PlaceName) { placeSaveWaiting = false; screenMode = placeParent >= 0 ? ScreenMode::PlacePick : ScreenMode::Places; return; }
+  if (screenMode == ScreenMode::PlacePick) { placeDeleteAsked = false; screenMode = ScreenMode::Places; return; }
+  if (screenMode == ScreenMode::Brightness && brightnessLevel != brightnessOpenedAt) logBrightnessChange(brightnessOpenedAt, brightnessLevel);
   manualWifiMode = false; statusPage = 0; screenMode = ScreenMode::Home;
 }
 
@@ -5541,6 +5866,7 @@ os::Owner frontApp() {
     case ScreenMode::Home: case ScreenMode::System: case ScreenMode::Remote:
     case ScreenMode::Networks: case ScreenMode::NetworkPassword: case ScreenMode::Volume: case ScreenMode::Status:
     case ScreenMode::Language: case ScreenMode::ChargingConfirm: case ScreenMode::Changelog:
+    case ScreenMode::Brightness: case ScreenMode::Places: case ScreenMode::PlacePick: case ScreenMode::PlaceName:
     case ScreenMode::Timer: case ScreenMode::Alarm: case ScreenMode::ScreenTime: case ScreenMode::Stopwatch: case ScreenMode::Morning: case ScreenMode::Agenda: return os::Owner::Ui;
     case ScreenMode::Library: case ScreenMode::LibrarySearch: case ScreenMode::NowPlaying: return os::mediaOwner();
     default: return os::Owner::Chat;
@@ -5711,7 +6037,7 @@ void serviceMedia() {
 
 // Keys for HOME and its apps, plus the back key from chat and the menu.
 bool handleAppKeys(const Keyboard_Class::KeysState &keys, bool goUp, bool goDown, bool goLeft, bool goRight) {
-  const bool escape = physicalKeyAt(0, 0) && (screenMode == ScreenMode::Chat || screenMode == ScreenMode::LibrarySearch || screenMode == ScreenMode::NetworkPassword ? keys.fn : true);
+  const bool escape = physicalKeyAt(0, 0) && (screenMode == ScreenMode::Chat || screenMode == ScreenMode::LibrarySearch || screenMode == ScreenMode::NetworkPassword || screenMode == ScreenMode::PlaceName ? keys.fn : true);
   if (escape && screenMode == ScreenMode::KeyHelp) { screenMode = ScreenMode::Chat; playNextTone(); renderDirty = true; return true; }
   if (escape && (screenMode == ScreenMode::Chat || screenMode == ScreenMode::Menu)) { screenMode = ScreenMode::Home; playNextTone(); renderDirty = true; return true; }
   if (escape && isSettingsScreen()) { leaveSettingsScreen(); playNextTone(); renderDirty = true; return true; }
@@ -5861,7 +6187,7 @@ void handleKeyboard() {
   // only Fn selects the arrow layer while a text field is active.
   // Text-entry screens prioritize punctuation and require Fn for arrows. On
   // navigation screens, the coloured arrows are primary and need no Fn.
-  const bool textEntryScreen = screenMode == ScreenMode::Chat || screenMode == ScreenMode::NetworkPassword || screenMode == ScreenMode::LibrarySearch;
+  const bool textEntryScreen = screenMode == ScreenMode::Chat || screenMode == ScreenMode::NetworkPassword || screenMode == ScreenMode::LibrarySearch || screenMode == ScreenMode::PlaceName;
   const bool otherModifier = keys.shift || keys.ctrl || keys.alt || keys.opt;
   // Text entry requires Fn to select the physical arrow layer. Navigation
   // screens treat those physical positions as arrows with or without Fn.
@@ -5905,6 +6231,65 @@ void handleKeyboard() {
     else if (goLeft) screenMode = ScreenMode::Menu;
     else if ((goRight || keys.enter) && roomCount() > 0) { selectRoom(roomSelection); screenMode=ScreenMode::Chat; }
     playNextTone(); renderDirty=true; return;
+  }
+  if (screenMode == ScreenMode::Brightness) {
+    if (goLeft || goRight) {
+      if (goLeft ? brightnessLevel > 0 : brightnessLevel + 1 < kBrightnessLevels) {
+        brightnessLevel += goLeft ? -1 : 1; M5Cardputer.Display.setBrightness(userBrightness()); saveVolume(); playNextTone();
+      } else playDeniedTone();
+    } else if (keys.enter) { leaveSettingsScreen(); playNextTone(); }
+    renderDirty = true; return;
+  }
+  if (screenMode == ScreenMode::Places) {
+    if (goUp || goDown) { const int row = goUp ? 0 : 1; if (row == placesRow) playDeniedTone(); else { placesRow = row; playNextTone(); } }
+    else if (keys.enter || goRight) {
+      placeNotice = "";
+      if (placesRow == 0) { placeParent = -1; placeName = ""; askPlaceScan(); screenMode = ScreenMode::PlaceName; playNextTone(); }
+      else if (!placePickCount()) { setPlaceNotice(uiText("NO PLACES YET: SAVE ONE FIRST", "AUCUN LIEU: ENREGISTRES-EN UN"), false); playDeniedTone(); }
+      else { placePickRow = 0; placeDeleteAsked = false; screenMode = ScreenMode::PlacePick; playNextTone(); }
+    } else if (goLeft) { leaveSettingsScreen(); playNextTone(); }
+    renderDirty = true; return;
+  }
+  if (screenMode == ScreenMode::PlacePick) {
+    const int count = placePickCount();
+    if (placeDeleteAsked) {
+      placeDeleteAsked = false;
+      if (keys.enter) {
+        const int slot = placePickSlot(placePickRow);
+        const String name = slot >= 0 ? String(placeList[slot].name) : String();
+        deletePlace(slot);
+        setPlaceNotice(String(uiText("DELETED: ", "EFFACE: ")) + name, true);
+        if (!placePickCount()) screenMode = ScreenMode::Places;
+      }
+      playNextTone(); renderDirty = true; return;
+    }
+    if (goUp) { if (placePickRow > 0) { placePickRow--; playNextTone(); } else playDeniedTone(); }
+    else if (goDown) { if (placePickRow + 1 < count) { placePickRow++; playNextTone(); } else playDeniedTone(); }
+    else if (keys.del && count) { placeDeleteAsked = true; placeNotice = ""; playNextTone(); }
+    else if ((keys.enter || goRight) && count) {
+      const int slot = placePickSlot(placePickRow);
+      if (placeList[slot].parent >= 0) { setPlaceNotice(uiText("CHOOSE A PLACE, NOT A PART", "CHOISIS UN LIEU, PAS UNE PARTIE"), false); playDeniedTone(); }
+      else { placeNotice = ""; placeParent = slot; placeName = ""; askPlaceScan(); screenMode = ScreenMode::PlaceName; playNextTone(); }
+    } else if (goLeft) { leaveSettingsScreen(); playNextTone(); }
+    renderDirty = true; return;
+  }
+  if (screenMode == ScreenMode::PlaceName) {
+    if (goLeft) { leaveSettingsScreen(); playNextTone(); renderDirty = true; return; }
+    playNextTone();
+    if (keys.enter) {
+      String name = placeName; name.trim();
+      if (name.isEmpty()) { setPlaceNotice(uiText("TYPE A NAME FIRST", "TAPE UN NOM D'ABORD"), false); playDeniedTone(); }
+      else if (places::nameTaken(placeList, name.c_str(), placeParent)) { setPlaceNotice(uiText("THAT NAME IS USED", "CE NOM EST DEJA PRIS"), false); playDeniedTone(); }
+      else if (placeScanSeq != placeScanAskedSeq) savePlaceNow();
+      else { placeSaveWaiting = true; setPlaceNotice(uiText("SAVING WHEN THE SCAN ENDS", "JE GARDE APRES LE SCAN"), true); }
+      renderDirty = true; return;
+    }
+    if (keys.del) { if (!frenchUi || !frenchTypist.cancel()) removeLastUtf8Character(placeName); renderDirty = true; return; }
+    if (frenchUi) { typeFrenchKeys(keys, placeName, places::kNameLetters); renderDirty = true; return; }
+    if (keys.space) appendKeyboardText(placeName, " ", places::kNameLetters, false);
+    for (const auto character : keys.word)
+      if (character >= 0x20 && character <= 0x7e) { const char text[] = {character, '\0'}; appendKeyboardText(placeName, text, places::kNameLetters, false); }
+    renderDirty = true; return;
   }
   if (screenMode == ScreenMode::Volume) {
     uint8_t &level = volumeRow == 0 ? alarmLevel : volumeRow == 1 ? systemLevel : mediaLevel;
@@ -6025,6 +6410,8 @@ void setup() {
   auto config = M5.config(); config.output_power = true;
   M5Cardputer.begin(config, true); M5Cardputer.Display.setRotation(1); M5Cardputer.Display.setTextWrap(false);
   loadConfiguration();
+  loadPlaces();
+  M5Cardputer.Display.setBrightness(userBrightness());
 #ifdef SUPACHAT_HOME_SSID
   // A network this device has never saved; every later boot finds it in NVS.
   if (std::none_of(wifiProfiles.begin(), wifiProfiles.end(), [](const WifiProfile &profile) { return profile.ssid == SUPACHAT_HOME_SSID; }))
@@ -6086,7 +6473,7 @@ static void loopBody() {
   M5Cardputer.update();
   if (M5Cardputer.BtnA.isPressed()) lastUserInputAt = millis();
   if (morningReload) { morningReload = false; loadMorningBrief(); renderDirty = true; }
-  serviceClockTrust(); serviceNightCheckAwake(); sampleBattery(); handleKeyboard(); serviceFoxFinding(); serviceClockApps();
+  serviceClockTrust(); serviceNightCheckAwake(); judgePlaceScan(); servicePlaceSave(); serviceBrightnessLog(); sampleBattery(); handleKeyboard(); serviceFoxFinding(); serviceClockApps();
   if (ringingNow() != Ringing::None && M5Cardputer.BtnA.wasClicked()) {
     if (clockapps::reached(millis(), ringKeysFrom)) dismissRinging(true);
     delay(2); return;

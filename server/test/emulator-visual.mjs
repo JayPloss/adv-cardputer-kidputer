@@ -75,6 +75,9 @@ await page.locator('[data-key="RIGHT"]').click(); assert.equal((await state()).v
 await page.getByRole('button', { name: '↑ ;' }).click(); await page.locator('[data-key="LEFT"]').click(); assert.equal((await state()).volumes.system, 2);
 await page.getByRole('button', { name: '↑ ;' }).click(); for (let i = 0; i < 3; i++) await page.locator('[data-key="LEFT"]').click(); assert.equal((await state()).volumes.alarm, 1);
 await shot('volume-alarm-low');
+// v0.68: BRIGHT and PLACES on HOME's last page.
+await openHome(18); await shot('brightness'); await page.locator('[data-key="LEFT"]').click(); assert.equal((await state()).brightness, 4);
+await openHome(19); await shot('places');
 await openHome(11); await shot('language'); await page.locator('[data-key="RIGHT"]').click(); assert.equal((await state()).languageOverride, 'en'); assert.equal((await state()).screen,'language');
 await openHome(8); await shot('networks'); await page.getByRole('button', { name: 'ENTER' }).click(); await shot('network-password');
 await page.reload(); await page.getByRole('button', { name: 'REAR · MENU' }).click(); await page.locator('[data-key="RIGHT"]').click(); await shot('menu-page-2');
